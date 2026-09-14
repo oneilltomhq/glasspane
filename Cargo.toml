@@ -1,0 +1,45 @@
+[package]
+name = "glasspane"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+authors = ["Tom O'Neill"]
+license = "MIT"
+repository = "https://github.com/oneilltomhq/glasspane"
+description = "A tenant Wayland compositor as a library: hosts Wayland clients and hands you one wgpu::Texture per client, plus an input-injection API. No placement policy, no scene, no scanout."
+keywords = ["wayland", "compositor", "wgpu", "dmabuf", "smithay"]
+categories = ["graphics", "gui", "os::linux-apis"]
+readme = "README.md"
+exclude = ["/.github", "/target"]
+
+[dependencies]
+wgpu = { version = "30.0.1", default-features = false, features = [
+    "std",
+    "vulkan",
+    "wgsl",
+] }
+wgpu-dmabuf = { path = "../wgpu-dmabuf" }
+drm-fourcc = "2"
+libc = "0.2"
+
+[dependencies.smithay]
+version = "0.7"
+default-features = false
+features = [
+    "backend_drm",
+    "backend_gbm",
+    "backend_libinput",
+    "backend_udev",
+    "backend_session_libseat",
+    "wayland_frontend",
+    "desktop",
+]
+
+[dev-dependencies]
+pollster = "0.4"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
+png = "0.17"
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]

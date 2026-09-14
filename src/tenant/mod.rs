@@ -1,0 +1,128 @@
+//! What a tenant *is*, from the shell's side of the seam.
+//!
+//! A tenant is one `xdg_toplevel`. It has an identity that outlives any
+//! particular buffer, a texture the shell can sample, and a generation counter
+//! that says whether the pixels moved. It has no position, no z-order, no
+//! parent and no camera: placing it is the shell's job and this crate has no
+//! opinion about it.
+
+use std::sync::Arc;
+
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::wayland::shell::xdg::ToplevelSurface;
+
+/// A tenant's identity, stable for its whole life and never reused within a
+/// run.
+///
+/// Index by this, never by position in [`crate::Glasspane::tenants`]: that
+/// order is not insertion order and a "the last one is the new one" reading
+/// produces real pixels under the wrong label, which is worse than an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TenantId(pub u64);
+
+impl std::fmt::Display for TenantId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "tenant#{}", self.0)
+    }
+}
+
+/// One hosted Wayland client surface, as the shell sees it.
+#[derive(Debug)]
+pub struct Tenant {
+    pub(crate) id: TenantId,
+    pub(crate) pid: Option<u32>,
+    pub(crate) title: Option<String>,
+    pub(crate) app_id: Option<String>,
+    pub(crate) size: (u32, u32),
+    pub(crate) configured: Option<(u32, u32)>,
+    pub(crate) texture: Option<Arc<wgpu::Texture>>,
+    pub(crate) generation: u64,
+    pub(crate) acquire_staged: bool,
+    pub(crate) surface: WlSurface,
+    pub(crate) toplevel: ToplevelSurface,
+}
+
+impl Tenant {
+    /// This tenant's identity.
+    pub fn id(&self) -> TenantId {
+        self.id
+    }
+
+    /// The client process, from the connection's peer credentials.
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
+    /// `xdg_toplevel.set_title`, if the client has sent one.
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    /// `xdg_toplevel.set_app_id`, if the client has sent one.
+    pub fn app_id(&self) -> Option<&str> {
+        self.app_id.as_deref()
+    }
+
+    /// The size of the last committed buffer, in pixels. This is the texture's
+    /// size, and it is what input coordinates are expressed in.
+    ///
+    /// Before the first commit this is the size this tenant was configured
+    /// with, which the client may not have honoured yet.
+    pub fn size(&self) -> (u32, u32) {
+        self.size
+    }
+
+    /// The size this tenant was last told to be, via
+    /// [`crate::Glasspane::configure`]. A resize is a negotiation — configure,
+    /// ack, commit — so this and [`Tenant::size`] disagree until the client
+    /// has painted, and a starved client keeps its old rect forever.
+    pub fn configured(&self) -> Option<(u32, u32)> {
+        self.configured
+    }
+
+    /// The texture holding this tenant's pixels, or `None` before its first
+    /// commit.
+    ///
+    /// **The handle is stable while [`Tenant::size`] is unchanged.** Every
+    /// commit lands in the same texture; the handle changes only across an
+    /// [`crate::Event::Resized`]. Index it, do not rebind per frame.
+    pub fn texture(&self) -> Option<&wgpu::Texture> {
+        self.texture.as_deref()
+    }
+
+    /// The texture as a shared handle, for a caller that wants to keep it
+    /// alive past the next `&mut Glasspane` call.
+    pub fn texture_arc(&self) -> Option<&Arc<wgpu::Texture>> {
+        self.texture.as_ref()
+    }
+
+    /// How many commits have landed in this texture. Bumps on every commit
+    /// that carried a buffer, including one that re-committed the same
+    /// `wl_buffer`.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Whether the last dma-buf commit's acquire fence was staged as a wait on
+    /// the caller's queue.
+    ///
+    /// glasspane does the waiting itself — the fence has to be on the queue
+    /// before the shell's next submit, and the shell does not know when a
+    /// commit happened. This reports that it was done, so a harness can fail
+    /// on a run that sampled client memory with nothing ordering it. Always
+    /// `false` for an `wl_shm` tenant, which has no GPU work to order.
+    pub fn acquire_staged(&self) -> bool {
+        self.acquire_staged
+    }
+
+    /// The underlying `wl_surface`, for a caller that needs to reach protocol
+    /// this crate does not wrap.
+    pub fn surface(&self) -> &WlSurface {
+        &self.surface
+    }
+
+    /// The underlying `xdg_toplevel`.
+    pub fn toplevel(&self) -> &ToplevelSurface {
+        &self.toplevel
+    }
+}
