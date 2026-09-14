@@ -50,9 +50,9 @@
 //! use std::time::{Duration, Instant};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+//! let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
 //!     backends: wgpu::Backends::VULKAN,
-//!     ..Default::default()
+//!     ..wgpu::InstanceDescriptor::new_without_display_handle_from_env()
 //! });
 //! let adapter = pollster::block_on(instance.request_adapter(&Default::default()))?;
 //! // Stock `request_device` cannot import an acquire fence; this can.

@@ -18,7 +18,9 @@ wgpu = { version = "30.0.1", default-features = false, features = [
     "vulkan",
     "wgsl",
 ] }
-wgpu-dmabuf = { path = "../wgpu-dmabuf" }
+# A version as well as a path: `cargo package` refuses a path-only dependency,
+# and the published crate must name what it needs from crates.io.
+wgpu-dmabuf = { path = "../wgpu-dmabuf", version = "0.1" }
 drm-fourcc = "2"
 libc = "0.2"
 
@@ -37,9 +39,15 @@ features = [
 
 [dev-dependencies]
 pollster = "0.4"
-wayland-client = "0.31"
-wayland-protocols = { version = "0.32", features = ["client"] }
+libc = "0.2"
 png = "0.17"
+# The test fixture is a *real* Wayland client on a real socket — glasspane is
+# the server, so the suite needs no Wayland session of its own — and it paints
+# through both transports, so it needs the client libraries and a GBM
+# allocator to mint a dma-buf with.
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+wgpu-dmabuf = { path = "../wgpu-dmabuf", features = ["gbm"] }
 
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]

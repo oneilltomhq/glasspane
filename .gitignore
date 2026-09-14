@@ -1,2 +1,5 @@
 /target
 Cargo.lock
+# what the examples write into the working directory
+/foot.png
+/chromium.png
