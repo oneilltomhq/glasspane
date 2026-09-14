@@ -6,6 +6,8 @@
 //! parent and no camera: placing it is the shell's job and this crate has no
 //! opinion about it.
 
+pub mod browser;
+
 use std::sync::Arc;
 
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
