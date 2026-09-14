@@ -91,6 +91,7 @@ pub mod acquire;
 mod convert;
 mod error;
 pub mod event;
+pub mod input;
 pub mod registry;
 mod state;
 pub mod tenant;
@@ -99,6 +100,7 @@ pub mod texture;
 pub use acquire::AcquireReport;
 pub use error::{Error, Result};
 pub use event::Event;
+pub use input::KeyState;
 pub use tenant::{Tenant, TenantId};
 
 /// The smithay this crate is built against, re-exported so a caller naming
