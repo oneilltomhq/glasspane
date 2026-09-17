@@ -6,6 +6,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `xdg_popup`: `Glasspane::popups`, `popup`, `Popup` (id, parent, root,
+  parent-relative position, size, texture, generation), and the
+  `Event::Popup*` family. A popup is hosted like a toplevel — own id, own
+  stable texture — and never appears in `tenants()`.
+- The positioner is resolved against the root tenant's own rectangle, through
+  smithay's `get_unconstrained_geometry`, so a popup near an edge flips or
+  slides rather than running off the pane.
+- `xdg_popup.grab` is honoured: a pointer button pressed outside a grabbing
+  popup's chain sends `popup_done` and is swallowed. `Glasspane::dismiss_popup`
+  and `dismiss_popups_of` do the same without a click.
+- `xdg_popup.reposition` is answered, and the popup moves.
+- `input::Target` and the `*_at` input entry points, for aiming pointer and
+  keyboard at a popup in its own buffer pixels. The `TenantId` entry points
+  are unchanged.
+- `Error::NoSuchPopup`.
+
 ## [0.1.0] - 2026-09-14
 
 First release. A Wayland compositor whose only output is textures.

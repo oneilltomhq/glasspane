@@ -83,6 +83,44 @@ frame.
 frames, and "the new window is the last one in the list" is a bug that produces
 real pixels under the wrong label.
 
+## Popups
+
+An `xdg_popup` — a `<select>` menu, an autocomplete list, a context menu, a
+permission bubble — is handed over exactly as a toplevel is: its own
+`PopupId`, its own texture, its own generation. What it has that a toplevel
+has not is a parent and a place.
+
+```rust
+for popup in pane.popups() {
+    let (x, y) = popup.position();   // top-left in popup.root()'s buffer pixels
+    let (w, h) = popup.size();
+    let _ = popup.texture();         // draw it over the pane you drew root() on
+}
+```
+
+`popups()` is a **separate list from `tenants()`**: a popup is not a tenant
+and a shell that keeps a row of windows must not find a menu in it. The
+position is always relative to the *root tenant*, never to an intermediate
+popup, so a submenu three deep still hangs off the one quad you drew the
+window on.
+
+The positioner is resolved here — anchor, gravity, offset, and the client's
+own `flip`/`slide`/`resize` permissions — against the root tenant's own
+rectangle rather than an output, because a tenant in someone's scene has no
+output and its rectangle is the only one both sides know the size of. So a
+`<select>` near the foot of a page opens upwards. What is *not* decided here
+is where the tenant is drawn, at what scale, or how far off its plane the
+popup is lifted: that is placement, and it stays the shell's.
+
+A grabbing popup is modal over its tenant. There is no seat grab to install —
+this crate has no input devices, the shell injects every event — so what a
+grab means is the one thing the client is waiting on: a pointer button pressed
+outside the popup's chain sends `popup_done` and is swallowed, exactly as a
+click outside a menu on a desktop closes the menu without also pressing what
+was under it. Without that a Chromium `<select>` hangs waiting for an event
+that never comes. `dismiss_popup` does the same for the cases that are not a
+click.
+
 ## The input contract
 
 Coordinates are **tenant-local buffer pixels, origin top-left** — the same
@@ -96,6 +134,14 @@ pane.pointer_button(glasspane::input::button::LEFT, KeyState::Pressed);
 pane.pointer_axis(0.0, 10.0, Some((0, 120)));
 pane.set_keyboard_focus(Some(id))?;
 pane.keyboard_key(Some(id), 30 /* KEY_A */, KeyState::Pressed)?;
+```
+
+A popup is aimed at the same way, through a `Target`, in **its own** buffer
+pixels rather than its parent's:
+
+```rust
+pane.pointer_enter_at(popup_id.into(), x, y)?;
+pane.set_keyboard_focus_at(Some(popup_id.into()))?;
 ```
 
 Keycodes are **evdev** codes, exactly as `linux/input-event-codes.h` and
@@ -137,10 +183,11 @@ Intel Iris Xe Graphics (RPL-U), Mesa 25.3.6, kernel 7.1.9, `/dev/dri/renderD128`
 
 ## Status
 
-v0.1. shm and single-plane `ARGB8888`/`XRGB8888` dma-buf, `xdg_shell` toplevels,
-server-side decorations refused politely, pointer, keyboard and axis injection.
+v0.1. shm and single-plane `ARGB8888`/`XRGB8888` dma-buf, `xdg_shell` toplevels
+and popups, server-side decorations refused politely, pointer, keyboard and
+axis injection.
 
-Not yet: subsurfaces, popups (`xdg_popup` is unimplemented), damage tracking
+Not yet: subsurfaces, damage tracking
 (an shm commit uploads the whole buffer), multi-plane formats, clipboard and
 drag-and-drop beyond the plumbing to accept them, `wp_viewport`, fractional
 scale, and KMS scanout of the composited result.

@@ -441,6 +441,33 @@ impl State {
     }
 }
 
+/// The positioner's answer, kept inside the root tenant's rectangle.
+///
+/// Split out from [`State::place`] so the arithmetic — which is the part that
+/// is wrong by a window-geometry offset or a sign if it is wrong at all — can
+/// be tested without a GPU, a socket or a client.
+fn place_in(
+    positioner: &PositionerState,
+    base: (i32, i32),
+    root_size: (u32, u32),
+) -> smithay::utils::Rectangle<i32, smithay::utils::Logical> {
+    use smithay::utils::{Point, Rectangle, Size};
+    if root_size.0 == 0 || root_size.1 == 0 {
+        // Nothing to constrain against: a tenant that has not painted yet has
+        // no rectangle, and inventing one would place every popup of a
+        // slow-starting client against a size it never had.
+        return positioner.get_geometry();
+    }
+    // The visible rectangle is the tenant's, expressed in the same space as
+    // the positioner's answer: relative to the parent's window geometry, which
+    // sits at `base` in the tenant.
+    let target = Rectangle::new(
+        Point::from((-base.0, -base.1)),
+        Size::from((root_size.0 as i32, root_size.1 as i32)),
+    );
+    (*positioner).get_unconstrained_geometry(target)
+}
+
 /// A surface's `xdg_surface.set_window_geometry` offset, in surface-local
 /// pixels. Zero for a client that has not set one, which is most of them.
 fn popup_geometry_loc(surface: &WlSurface) -> (i32, i32) {
@@ -506,22 +533,11 @@ impl State {
         root: TenantId,
         base: (i32, i32),
     ) -> smithay::utils::Rectangle<i32, smithay::utils::Logical> {
-        use smithay::utils::{Point, Rectangle, Size};
         let size = self
             .index_of(root)
             .map(|i| self.tenants[i].skin.size)
             .unwrap_or((0, 0));
-        if size.0 == 0 || size.1 == 0 {
-            return positioner.get_geometry();
-        }
-        // The visible rectangle is the tenant's, expressed in the same space
-        // as the positioner's answer: relative to the parent's window
-        // geometry, which sits at `base` in the tenant.
-        let target = Rectangle::new(
-            Point::from((-base.0, -base.1)),
-            Size::from((size.0 as i32, size.1 as i32)),
-        );
-        (*positioner).get_unconstrained_geometry(target)
+        place_in(positioner, base, size)
     }
 
     /// Re-read a popup's own window geometry after a commit and move it if the
@@ -1071,5 +1087,82 @@ impl State {
             .map_err(|e| crate::Error::Socket(format!("seat keyboard: {e}")))?;
         let pointer = seat.add_pointer();
         Ok((seat, keyboard, pointer))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::place_in;
+    use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_positioner::{
+        Anchor, ConstraintAdjustment, Gravity,
+    };
+    use smithay::utils::{Point, Rectangle, Size};
+    use smithay::wayland::shell::xdg::PositionerState;
+
+    /// A `<select>` at `(x, y)` on the page, `w` x `h`, opening downwards —
+    /// which is what Chromium's menus ask for.
+    fn menu(x: i32, y: i32, w: i32, h: i32) -> PositionerState {
+        PositionerState {
+            rect_size: Size::from((w, h)),
+            anchor_rect: Rectangle::new(Point::from((x, y)), Size::from((1, 1))),
+            anchor_edges: Anchor::BottomLeft,
+            gravity: Gravity::BottomRight,
+            constraint_adjustment: ConstraintAdjustment::FlipY
+                | ConstraintAdjustment::SlideX
+                | ConstraintAdjustment::SlideY,
+            ..Default::default()
+        }
+    }
+
+    /// A menu with room below it lands under its anchor, and nowhere else. The
+    /// numbers are the anchor's, not a guess: bottom-left anchor with
+    /// bottom-right gravity is "hang from this point, growing right and down".
+    #[test]
+    fn a_menu_hangs_from_its_anchor() {
+        let geo = place_in(&menu(100, 200, 160, 120), (0, 0), (1280, 800));
+        assert_eq!((geo.loc.x, geo.loc.y), (100, 201));
+        assert_eq!((geo.size.w, geo.size.h), (160, 120));
+    }
+
+    /// A menu near the foot of the page flips above its anchor rather than
+    /// running off the end of the pane. This is the whole reason the tenant's
+    /// rectangle is used as the constraint target: with no target it would be
+    /// placed at y = 761 on an 800-pixel pane and half of it would be nowhere.
+    #[test]
+    fn a_menu_at_the_foot_flips_up() {
+        let geo = place_in(&menu(100, 760, 160, 120), (0, 0), (1280, 800));
+        assert!(
+            geo.loc.y + geo.size.h <= 800,
+            "flipped menu still runs off the pane: {geo:?}"
+        );
+        assert!(geo.loc.y < 760, "it did not flip: {geo:?}");
+    }
+
+    /// The constraint rectangle follows the parent's window geometry. A parent
+    /// whose window starts 40 pixels into its buffer has 40 fewer pixels below
+    /// the anchor, so the target rectangle starts at -40 in the positioner's
+    /// space — and a menu that fitted at `base = 0` is pushed or flipped here.
+    #[test]
+    fn the_constraint_is_relative_to_the_parents_window_geometry() {
+        // It fits below the anchor on the pane (671 + 120 = 791 < 800), but
+        // not once the parent's window starts 40 pixels down the buffer.
+        let p = menu(100, 670, 160, 120);
+        let flat = place_in(&p, (0, 0), (1280, 800));
+        let inset = place_in(&p, (0, 40), (1280, 800));
+        assert_ne!(flat, inset, "the base offset made no difference");
+        assert_eq!((flat.loc.x, flat.loc.y), (100, 671), "it should fit as it is");
+        assert!(
+            inset.loc.y + inset.size.h <= 800 - 40,
+            "constrained against the wrong rectangle: {inset:?}"
+        );
+    }
+
+    /// A tenant that has not painted has no rectangle to constrain against,
+    /// and the positioner's own answer is used unchanged rather than being
+    /// squeezed into a size the tenant never had.
+    #[test]
+    fn an_unpainted_tenant_constrains_nothing() {
+        let p = menu(100, 760, 160, 120);
+        assert_eq!(place_in(&p, (0, 0), (0, 0)), p.get_geometry());
     }
 }
