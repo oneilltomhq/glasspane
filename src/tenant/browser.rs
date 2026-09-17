@@ -111,7 +111,6 @@ pub fn argv(url: &str, profile_dir: &Path, cdp_port: u16) -> Vec<String> {
         // Startup noise that costs seconds and can fail. None of it is needed
         // to paint a page, and each one is a way for a headless run to become
         // flaky for reasons unrelated to the compositor.
-        "--disable-extensions".into(),
         "--disable-default-apps".into(),
         "--disable-component-update".into(),
         "--disable-sync".into(),
