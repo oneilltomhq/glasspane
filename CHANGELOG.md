@@ -24,6 +24,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   are unchanged.
 - `Error::NoSuchPopup`.
 
+### Changed
+
+- The focused tenant is told it is focused: `xdg_toplevel` carries the
+  `activated` state, and keeps it while one of its own popups has the
+  keyboard. A browser only offers a menu to a window it believes is active.
+- Every surface is sent `wl_surface.enter` for the one output when it is
+  mapped, toplevel or popup. A client with no `enter` has to guess its scale.
+
 ## [0.1.0] - 2026-09-14
 
 First release. A Wayland compositor whose only output is textures.

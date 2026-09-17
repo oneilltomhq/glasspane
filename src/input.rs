@@ -299,6 +299,14 @@ impl Glasspane {
         let keyboard = self.state.keyboard.clone();
         keyboard.set_focus(&mut self.state, surface, serial);
         self.state.keyboard_focus = target;
+        // The window a popup belongs to stays the active one while the popup
+        // has the keyboard: a menu does not deactivate the window it is over.
+        let active = match target {
+            Some(Target::Tenant(id)) => Some(id),
+            Some(Target::Popup(id)) => self.state.popup(id).map(|p| p.root),
+            None => None,
+        };
+        self.state.set_active(active);
         self.state.flush();
         Ok(())
     }

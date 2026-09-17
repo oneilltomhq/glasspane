@@ -153,12 +153,45 @@ impl std::fmt::Debug for State {
 }
 
 impl State {
+    /// Say which tenant is the active window, and tell the others they are
+    /// not.
+    ///
+    /// `xdg_toplevel.configure` carries an `activated` state, and a toolkit
+    /// that is not told it has it behaves like a window in the background:
+    /// Chromium in particular will create a menu's `xdg_popup` and then never
+    /// lay the menu out, so the popup maps at 1x1 and the human sees nothing.
+    /// Keyboard focus is the one signal this crate has for "active", so the
+    /// two are kept together.
+    pub(crate) fn set_active(&mut self, active: Option<TenantId>) {
+        use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+        for tenant in &self.tenants {
+            let want = Some(tenant.id) == active;
+            let toplevel = tenant.toplevel.clone();
+            let has = toplevel.with_pending_state(|state| {
+                let has = state.states.contains(xdg_toplevel::State::Activated);
+                if want && !has {
+                    state.states.set(xdg_toplevel::State::Activated);
+                } else if !want && has {
+                    state.states.unset(xdg_toplevel::State::Activated);
+                }
+                has
+            });
+            if want != has && toplevel.is_initial_configure_sent() {
+                toplevel.send_pending_configure();
+            }
+        }
+    }
+
     pub(crate) fn index_of(&self, id: TenantId) -> Option<usize> {
         self.tenants.iter().position(|t| t.id == id)
     }
 
     pub(crate) fn index_of_surface(&self, surface: &WlSurface) -> Option<usize> {
         self.tenants.iter().position(|t| &t.surface == surface)
+    }
+
+    pub(crate) fn popup(&self, id: PopupId) -> Option<&Popup> {
+        self.popups.iter().find(|p| p.id == id)
     }
 
     pub(crate) fn index_of_popup(&self, id: PopupId) -> Option<usize> {
@@ -796,6 +829,9 @@ impl XdgShellHandler for State {
         let id = TenantId(self.next_tenant);
         let surface = toplevel.wl_surface().clone();
         let pid = self.pid_of(&surface);
+        // A client that never gets `wl_surface.enter` has to guess which
+        // output it is on, and some of them guess a scale of zero.
+        self.output.enter(&surface);
         let size = self.default_size;
         toplevel.with_pending_state(|state| {
             state.size = Some((size.0 as i32, size.1 as i32).into());
@@ -873,13 +909,15 @@ impl XdgShellHandler for State {
             state.positioner = positioner;
             state.geometry = geometry;
         });
-        let _ = surface.send_configure();
 
         self.next_popup += 1;
         let id = PopupId(self.next_popup);
         let anchor = (base.0 + geometry.loc.x, base.1 + geometry.loc.y);
         let size = (geometry.size.w.max(0) as u32, geometry.size.h.max(0) as u32);
         let wl_surface = surface.wl_surface().clone();
+        // Same as a toplevel: the client is told which output it is on before
+        // it is asked to paint.
+        self.output.enter(&wl_surface);
         self.popups.push(Popup {
             id,
             parent,
