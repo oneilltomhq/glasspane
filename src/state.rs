@@ -37,15 +37,30 @@ use smithay::wayland::selection::data_device::{
 };
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
 use smithay::wayland::shell::xdg::{
-    PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
-    XdgToplevelSurfaceData,
+    PopupSurface, PositionerState, SurfaceCachedState, ToplevelSurface, XdgShellHandler,
+    XdgShellState, XdgToplevelSurfaceData,
 };
 use smithay::wayland::shm::{ShmHandler, ShmState, with_buffer_contents};
 
 use crate::acquire::AcquireGate;
+use crate::input::Target;
+use crate::popup::{Parent, Popup, PopupId};
 use crate::registry::{BufferKey, Registry};
 use crate::tenant::{Tenant, TenantId};
+use crate::texture::Skin;
 use crate::{texture, Event};
+
+/// Which of the two lists a commit, a texture or an input event is about.
+///
+/// A toplevel and a popup are different things to the shell and the same thing
+/// to the buffer path, so the buffer path is written once against this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Slot {
+    /// An index into [`State::tenants`].
+    Tenant(usize),
+    /// An index into [`State::popups`].
+    Popup(usize),
+}
 
 /// Per-client data. The pid is read once, from the socket's peer credentials,
 /// because it is the only thing that ties a tenant back to a
@@ -110,11 +125,19 @@ pub struct State {
     pub(crate) acquire: Option<AcquireGate>,
     pub(crate) tenants: Vec<Tenant>,
     pub(crate) next_tenant: u64,
+    pub(crate) popups: Vec<Popup>,
+    pub(crate) next_popup: u64,
+    /// The popup holding an explicit grab, if any: while it is up, a button
+    /// pressed outside its chain dismisses it instead of reaching what is
+    /// under the cursor.
+    pub(crate) grab: Option<PopupId>,
+    /// Where the keyboard was before the grab took it, to put it back.
+    pub(crate) focus_before_grab: Option<Target>,
     pub(crate) events: VecDeque<Event>,
     pub(crate) pending_callbacks: Vec<WlCallback>,
     pub(crate) default_size: (u32, u32),
-    pub(crate) keyboard_focus: Option<TenantId>,
-    pub(crate) pointer_focus: Option<TenantId>,
+    pub(crate) keyboard_focus: Option<Target>,
+    pub(crate) pointer_focus: Option<Target>,
     pub(crate) ticks: u64,
     pub(crate) callbacks_sent: u64,
 }
@@ -136,6 +159,49 @@ impl State {
 
     pub(crate) fn index_of_surface(&self, surface: &WlSurface) -> Option<usize> {
         self.tenants.iter().position(|t| &t.surface == surface)
+    }
+
+    pub(crate) fn index_of_popup(&self, id: PopupId) -> Option<usize> {
+        self.popups.iter().position(|p| p.id == id)
+    }
+
+    pub(crate) fn index_of_popup_surface(&self, surface: &WlSurface) -> Option<usize> {
+        self.popups.iter().position(|p| &p.surface == surface)
+    }
+
+    /// Which list this surface is in, if either.
+    fn slot_of_surface(&self, surface: &WlSurface) -> Option<Slot> {
+        self.index_of_surface(surface)
+            .map(Slot::Tenant)
+            .or_else(|| self.index_of_popup_surface(surface).map(Slot::Popup))
+    }
+
+    pub(crate) fn slot_of_target(&self, target: Target) -> Option<Slot> {
+        match target {
+            Target::Tenant(id) => self.index_of(id).map(Slot::Tenant),
+            Target::Popup(id) => self.index_of_popup(id).map(Slot::Popup),
+        }
+    }
+
+    pub(crate) fn surface_of(&self, slot: Slot) -> WlSurface {
+        match slot {
+            Slot::Tenant(i) => self.tenants[i].surface.clone(),
+            Slot::Popup(i) => self.popups[i].surface.clone(),
+        }
+    }
+
+    fn skin_mut(&mut self, slot: Slot) -> &mut Skin {
+        match slot {
+            Slot::Tenant(i) => &mut self.tenants[i].skin,
+            Slot::Popup(i) => &mut self.popups[i].skin,
+        }
+    }
+
+    fn skin(&self, slot: Slot) -> &Skin {
+        match slot {
+            Slot::Tenant(i) => &self.tenants[i].skin,
+            Slot::Popup(i) => &self.popups[i].skin,
+        }
     }
 
     pub(crate) fn emit(&mut self, event: Event) {
@@ -223,47 +289,76 @@ impl State {
 
     /// Make sure this tenant's texture is `width` x `height`, recreating it —
     /// and saying so — if it is not.
-    fn ensure_texture(&mut self, index: usize, width: u32, height: u32) {
-        let id = self.tenants[index].id;
-        let fits = self.tenants[index]
+    fn ensure_texture(&mut self, slot: Slot, width: u32, height: u32) {
+        let fits = self
+            .skin(slot)
             .texture
             .as_ref()
             .is_some_and(|t| t.width() == width && t.height() == height);
         if fits {
             return;
         }
-        let tex = texture::create_tenant_texture(&self.device, id, width, height);
-        self.tenants[index].texture = Some(Arc::new(tex));
-        self.tenants[index].size = (width, height);
-        self.emit(Event::Resized {
-            id,
-            size: (width, height),
-        });
+        let label = match slot {
+            Slot::Tenant(i) => format!("tenant#{}", self.tenants[i].id.0),
+            Slot::Popup(i) => format!("popup#{}", self.popups[i].id.0),
+        };
+        let tex = texture::create_surface_texture(&self.device, &label, width, height);
+        let skin = self.skin_mut(slot);
+        skin.texture = Some(Arc::new(tex));
+        skin.size = (width, height);
+        let event = match slot {
+            Slot::Tenant(i) => Event::Resized {
+                id: self.tenants[i].id,
+                size: (width, height),
+            },
+            Slot::Popup(i) => Event::PopupResized {
+                id: self.popups[i].id,
+                size: (width, height),
+            },
+        };
+        self.emit(event);
     }
 
     /// One committed buffer becomes texels.
-    fn absorb_buffer(&mut self, index: usize, buffer: &WlBuffer) {
-        let id = self.tenants[index].id;
+    fn absorb_buffer(&mut self, slot: Slot, buffer: &WlBuffer) {
         let key = buffer_key(buffer);
 
         let result = match get_dmabuf(buffer) {
-            Ok(dmabuf) => self.absorb_dmabuf(index, key, &dmabuf.clone()),
-            Err(_) => self.absorb_shm(index, buffer),
+            Ok(dmabuf) => self.absorb_dmabuf(slot, key, &dmabuf.clone()),
+            Err(_) => self.absorb_shm(slot, buffer),
         };
 
         match result {
             Ok(()) => {
-                self.tenants[index].generation += 1;
-                let generation = self.tenants[index].generation;
-                self.emit(Event::Committed { id, generation });
+                self.skin_mut(slot).generation += 1;
+                let generation = self.skin(slot).generation;
+                let event = match slot {
+                    Slot::Tenant(i) => Event::Committed {
+                        id: self.tenants[i].id,
+                        generation,
+                    },
+                    Slot::Popup(i) => Event::PopupCommitted {
+                        id: self.popups[i].id,
+                        generation,
+                    },
+                };
+                self.emit(event);
             }
-            Err(why) => self.reject(Some(id), why),
+            Err(why) => {
+                let id = match slot {
+                    Slot::Tenant(i) => Some(self.tenants[i].id),
+                    // A popup's pixels belong to its root tenant as far as a
+                    // shell watching for trouble is concerned.
+                    Slot::Popup(i) => Some(self.popups[i].root),
+                };
+                self.reject(id, why);
+            }
         }
     }
 
     fn absorb_dmabuf(
         &mut self,
-        index: usize,
+        slot: Slot,
         key: BufferKey,
         dmabuf: &Dmabuf,
     ) -> Result<(), String> {
@@ -278,9 +373,9 @@ impl State {
                 .next()
                 .ok_or_else(|| "dmabuf has no plane handle".to_string())?;
             gate.wait_for(key, plane)?;
-            self.tenants[index].acquire_staged = true;
+            self.skin_mut(slot).acquire_staged = true;
         } else {
-            self.tenants[index].acquire_staged = false;
+            self.skin_mut(slot).acquire_staged = false;
         }
 
         let (width, height) = (dmabuf.width(), dmabuf.height());
@@ -293,8 +388,9 @@ impl State {
             })
             .map_err(|e| format!("dmabuf import failed: {e}"))?;
 
-        self.ensure_texture(index, width, height);
-        let dst = self.tenants[index]
+        self.ensure_texture(slot, width, height);
+        let dst = self
+            .skin(slot)
             .texture
             .clone()
             .expect("ensure_texture just set it");
@@ -302,7 +398,7 @@ impl State {
         Ok(())
     }
 
-    fn absorb_shm(&mut self, index: usize, buffer: &WlBuffer) -> Result<(), String> {
+    fn absorb_shm(&mut self, slot: Slot, buffer: &WlBuffer) -> Result<(), String> {
         let read = with_buffer_contents(buffer, |ptr, len, data| {
             match data.format {
                 wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888 => {}
@@ -333,14 +429,232 @@ impl State {
             Ok(Err(e)) => return Err(e),
             Err(e) => return Err(format!("buffer is neither dma-buf nor wl_shm: {e}")),
         };
-        self.tenants[index].acquire_staged = false;
-        self.ensure_texture(index, w, h);
-        let dst = self.tenants[index]
+        self.skin_mut(slot).acquire_staged = false;
+        self.ensure_texture(slot, w, h);
+        let dst = self
+            .skin(slot)
             .texture
             .clone()
             .expect("ensure_texture just set it");
         texture::upload_shm(&self.queue, &dst, &bytes, stride, w, h);
         Ok(())
+    }
+}
+
+/// A surface's `xdg_surface.set_window_geometry` offset, in surface-local
+/// pixels. Zero for a client that has not set one, which is most of them.
+fn popup_geometry_loc(surface: &WlSurface) -> (i32, i32) {
+    with_states(surface, |states| {
+        states
+            .cached_state
+            .get::<SurfaceCachedState>()
+            .current()
+            .geometry
+            .map(|g| (g.loc.x, g.loc.y))
+            .unwrap_or((0, 0))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Popups
+// ---------------------------------------------------------------------------
+
+impl State {
+    /// Resolve `parent_surface` into the popup's parent, its root tenant, and
+    /// the point its positioner is resolved against (the parent's window
+    /// geometry origin, in the root tenant's buffer pixels).
+    fn parent_of(&self, parent_surface: &WlSurface) -> Option<(Parent, TenantId, (i32, i32))> {
+        if let Some(i) = self.index_of_surface(parent_surface) {
+            let id = self.tenants[i].id;
+            return Some((
+                Parent::Tenant(id),
+                id,
+                popup_geometry_loc(parent_surface),
+            ));
+        }
+        let i = self.index_of_popup_surface(parent_surface)?;
+        let p = &self.popups[i];
+        Some((Parent::Popup(p.id), p.root, p.anchor))
+    }
+
+    /// The same point for a parent already known by identity.
+    fn base_of_parent(&self, parent: Parent) -> (i32, i32) {
+        match parent {
+            Parent::Tenant(id) => match self.index_of(id) {
+                Some(i) => popup_geometry_loc(&self.tenants[i].surface),
+                None => (0, 0),
+            },
+            Parent::Popup(id) => match self.index_of_popup(id) {
+                Some(i) => self.popups[i].anchor,
+                None => (0, 0),
+            },
+        }
+    }
+
+    /// The positioner, resolved.
+    ///
+    /// The rectangle a popup is kept inside is its **root tenant's own
+    /// surface**, not an output: a pane in a scene has no output, and the
+    /// tenant's rectangle is the only thing the client and this compositor
+    /// both know the size of. `get_unconstrained_geometry` then applies the
+    /// client's own `flip`, `slide` and `resize` permissions, which is how a
+    /// `<select>` near the bottom of a page opens upwards instead of off the
+    /// end of the pane.
+    fn place(
+        &self,
+        positioner: &PositionerState,
+        root: TenantId,
+        base: (i32, i32),
+    ) -> smithay::utils::Rectangle<i32, smithay::utils::Logical> {
+        use smithay::utils::{Point, Rectangle, Size};
+        let size = self
+            .index_of(root)
+            .map(|i| self.tenants[i].skin.size)
+            .unwrap_or((0, 0));
+        if size.0 == 0 || size.1 == 0 {
+            return positioner.get_geometry();
+        }
+        // The visible rectangle is the tenant's, expressed in the same space
+        // as the positioner's answer: relative to the parent's window
+        // geometry, which sits at `base` in the tenant.
+        let target = Rectangle::new(
+            Point::from((-base.0, -base.1)),
+            Size::from((size.0 as i32, size.1 as i32)),
+        );
+        (*positioner).get_unconstrained_geometry(target)
+    }
+
+    /// Re-read a popup's own window geometry after a commit and move it if the
+    /// offset between its buffer and its window changed.
+    fn refresh_popup_position(&mut self, index: usize) {
+        let own = popup_geometry_loc(&self.popups[index].surface);
+        let anchor = self.popups[index].anchor;
+        let position = (anchor.0 - own.0, anchor.1 - own.1);
+        if position == self.popups[index].position {
+            return;
+        }
+        self.popups[index].position = position;
+        let id = self.popups[index].id;
+        let size = self.popups[index].skin.size;
+        self.emit(Event::PopupMoved { id, position, size });
+    }
+
+    /// Every popup hanging off `id`, deepest first.
+    fn descendants_of(&self, id: PopupId) -> Vec<PopupId> {
+        let mut out = Vec::new();
+        let mut frontier = vec![id];
+        while let Some(parent) = frontier.pop() {
+            for p in self.popups.iter().filter(|p| p.parent == Parent::Popup(parent)) {
+                out.push(p.id);
+                frontier.push(p.id);
+            }
+        }
+        out.reverse();
+        out
+    }
+
+    /// Is `id` inside the chain rooted at `root` — the chain a grab covers?
+    pub(crate) fn in_chain(&self, id: PopupId, root: PopupId) -> bool {
+        if id == root {
+            return true;
+        }
+        let mut at = id;
+        loop {
+            let Some(i) = self.index_of_popup(at) else {
+                return false;
+            };
+            match self.popups[i].parent {
+                Parent::Popup(next) if next == root => return true,
+                Parent::Popup(next) => at = next,
+                Parent::Tenant(_) => return false,
+            }
+        }
+    }
+
+    /// Drop `id` and everything under it, optionally telling the client first.
+    ///
+    /// The popup is forgotten here rather than when the client gets round to
+    /// destroying the object, because the shell must stop drawing a dismissed
+    /// menu *now*. A client that ignores `popup_done` and destroys the popup
+    /// later finds nothing left to remove, which is the same outcome.
+    pub(crate) fn forget_popup_chain(&mut self, id: PopupId, tell: bool) {
+        let mut doomed = self.descendants_of(id);
+        doomed.push(id);
+        for gone in doomed {
+            let Some(i) = self.index_of_popup(gone) else {
+                continue;
+            };
+            let popup = self.popups.remove(i);
+            if tell && popup.popup.alive() {
+                popup.popup.send_popup_done();
+            }
+            if self.pointer_focus == Some(Target::Popup(gone)) {
+                self.pointer_focus = None;
+            }
+            if self.focus_before_grab == Some(Target::Popup(gone)) {
+                self.focus_before_grab = None;
+            }
+            self.emit(Event::PopupUnmapped { id: gone });
+        }
+        if self.grab.is_some_and(|g| self.index_of_popup(g).is_none()) {
+            self.release_grab();
+        }
+        self.flush();
+    }
+
+    /// Give the keyboard back to whoever had it before the grab.
+    fn release_grab(&mut self) {
+        self.grab = None;
+        let back = self.focus_before_grab.take();
+        let surface = back.and_then(|t| self.slot_of_target(t)).map(|slot| self.surface_of(slot));
+        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+        self.keyboard.clone().set_focus(self, surface, serial);
+        self.keyboard_focus = back.filter(|t| self.slot_of_target(*t).is_some());
+    }
+
+    /// Dismiss the grabbing popup and its chain: `popup_done` to the client,
+    /// gone from the shell's list.
+    pub(crate) fn dismiss_grab(&mut self) {
+        if let Some(id) = self.grab {
+            self.forget_popup_chain(id, true);
+        }
+    }
+
+    /// Take down every popup belonging to a tenant.
+    pub(crate) fn close_popups_of(&mut self, root: TenantId, tell: bool) {
+        let roots: Vec<PopupId> = self
+            .popups
+            .iter()
+            .filter(|p| p.root == root && matches!(p.parent, Parent::Tenant(_)))
+            .map(|p| p.id)
+            .collect();
+        for id in roots {
+            self.forget_popup_chain(id, tell);
+        }
+        // A popup whose chain was rooted elsewhere cannot survive its tenant.
+        let orphans: Vec<PopupId> = self
+            .popups
+            .iter()
+            .filter(|p| p.root == root)
+            .map(|p| p.id)
+            .collect();
+        for id in orphans {
+            self.forget_popup_chain(id, tell);
+        }
+    }
+
+    /// Forget popups whose protocol object has gone away without a
+    /// `popup_destroyed` reaching us — a client that disconnected mid-menu.
+    pub(crate) fn prune_popups(&mut self) {
+        let dead: Vec<PopupId> = self
+            .popups
+            .iter()
+            .filter(|p| !p.popup.alive())
+            .map(|p| p.id)
+            .collect();
+        for id in dead {
+            self.forget_popup_chain(id, false);
+        }
     }
 }
 
@@ -369,18 +683,38 @@ impl CompositorHandler for State {
             (buffer, callbacks)
         });
 
-        if let Some(index) = self.index_of_surface(surface) {
-            self.refresh_identity(index);
-            // The initial configure must be answered before a client is
-            // allowed to attach: a toplevel that commits without one is a
-            // protocol error on our side, not theirs.
-            let toplevel = self.tenants[index].toplevel.clone();
-            if !toplevel.is_initial_configure_sent() {
-                toplevel.send_configure();
+        match self.slot_of_surface(surface) {
+            Some(Slot::Tenant(index)) => {
+                self.refresh_identity(index);
+                // The initial configure must be answered before a client is
+                // allowed to attach: a toplevel that commits without one is a
+                // protocol error on our side, not theirs.
+                let toplevel = self.tenants[index].toplevel.clone();
+                if !toplevel.is_initial_configure_sent() {
+                    toplevel.send_configure();
+                }
+                if let Some(buffer) = buffer {
+                    self.absorb_buffer(Slot::Tenant(index), &buffer);
+                }
             }
-            if let Some(buffer) = buffer {
-                self.absorb_buffer(index, &buffer);
+            Some(Slot::Popup(index)) => {
+                // Same rule, same reason: a popup that attaches before it has
+                // been configured is a protocol error.
+                let popup = self.popups[index].popup.clone();
+                if !popup.is_initial_configure_sent() {
+                    let _ = popup.send_configure();
+                }
+                // The client's own window geometry is only known once it has
+                // committed one, and it is the difference between where the
+                // popup's *buffer* starts and where its *window* does — the
+                // shadow margin, for a client that draws one. Re-read it here
+                // and move the popup if it moved.
+                self.refresh_popup_position(index);
+                if let Some(buffer) = buffer {
+                    self.absorb_buffer(Slot::Popup(index), &buffer);
+                }
             }
+            None => {}
         }
 
         // Harvested, not answered: [`State::release_frame_callbacks`] answers
@@ -456,11 +790,11 @@ impl XdgShellHandler for State {
             pid,
             title: None,
             app_id: None,
-            size,
             configured: Some(size),
-            texture: None,
-            generation: 0,
-            acquire_staged: false,
+            skin: Skin {
+                size,
+                ..Default::default()
+            },
             surface,
             toplevel,
         });
@@ -477,41 +811,165 @@ impl XdgShellHandler for State {
             return;
         };
         let gone = self.tenants.remove(index);
-        if self.keyboard_focus == Some(gone.id) {
+        // A popup belongs to its tenant and cannot outlive it. `popup_done`
+        // is sent anyway: the client may still be alive and holding the
+        // object, and a popup whose parent vanished is exactly what the event
+        // is for.
+        self.close_popups_of(gone.id, true);
+        if self.keyboard_focus == Some(Target::Tenant(gone.id)) {
             self.keyboard_focus = None;
             let serial = smithay::utils::SERIAL_COUNTER.next_serial();
             self.keyboard.clone().set_focus(self, None, serial);
         }
-        if self.pointer_focus == Some(gone.id) {
+        if self.pointer_focus == Some(Target::Tenant(gone.id)) {
             self.pointer_focus = None;
+        }
+        if self.focus_before_grab == Some(Target::Tenant(gone.id)) {
+            self.focus_before_grab = None;
         }
         self.emit(Event::Unmapped { id: gone.id });
     }
 
-    // Popups are out of scope: this crate hands the shell one texture per
-    // toplevel, and a popup is a second surface with a position relative to
-    // its parent — i.e. placement policy, which belongs to the shell. A popup
-    // request is answered with a configure so the client does not hang, and
-    // nothing else.
-    fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
+    /// A popup is a second surface over a tenant: it gets its own id, its own
+    /// texture and a position, and the shell draws it wherever it draws that
+    /// tenant.
+    ///
+    /// The positioner is resolved here and not in the shell, because resolving
+    /// it is protocol — anchor, gravity, offset and the constraint rules — and
+    /// not placement. What *is* placement, and stays the shell's, is where the
+    /// pane the popup hangs off is, how the position is scaled, and how far
+    /// off its plane the popup is lifted.
+    fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
+        let Some(parent_surface) = surface.get_parent_surface() else {
+            // No parent yet: the client will set one before it commits, and
+            // the protocol makes committing without one its error, not ours.
+            let _ = surface.send_configure();
+            return;
+        };
+        let Some((parent, root, base)) = self.parent_of(&parent_surface) else {
+            self.reject(None, "xdg_popup on a surface this compositor does not host".into());
+            let _ = surface.send_configure();
+            return;
+        };
+
+        let geometry = self.place(&positioner, root, base);
+        surface.with_pending_state(|state| {
+            state.positioner = positioner;
+            state.geometry = geometry;
+        });
         let _ = surface.send_configure();
+
+        self.next_popup += 1;
+        let id = PopupId(self.next_popup);
+        let anchor = (base.0 + geometry.loc.x, base.1 + geometry.loc.y);
+        let size = (geometry.size.w.max(0) as u32, geometry.size.h.max(0) as u32);
+        let wl_surface = surface.wl_surface().clone();
+        self.popups.push(Popup {
+            id,
+            parent,
+            root,
+            anchor,
+            position: anchor,
+            grabbed: false,
+            skin: Skin {
+                size,
+                ..Default::default()
+            },
+            surface: wl_surface,
+            popup: surface,
+        });
+        self.emit(Event::PopupMapped {
+            id,
+            parent,
+            root,
+            position: anchor,
+            size,
+        });
+        self.flush();
     }
 
+    /// The popup asks to be modal.
+    ///
+    /// This crate has no input devices of its own — the shell injects every
+    /// motion and every button — so there is no seat grab to install. What a
+    /// grab means here is the one behaviour the client is actually waiting on:
+    /// a button pressed outside this popup's chain sends `popup_done` instead
+    /// of reaching what is under it. Without that a `<select>` menu never
+    /// closes and the page behind it never gets its click, which is the
+    /// hanging-Chromium shape.
     fn grab(
         &mut self,
-        _surface: PopupSurface,
+        surface: PopupSurface,
         _seat: smithay::reexports::wayland_server::protocol::wl_seat::WlSeat,
         _serial: smithay::utils::Serial,
     ) {
+        let Some(index) = self.index_of_popup_surface(surface.wl_surface()) else {
+            return;
+        };
+        let id = self.popups[index].id;
+        self.popups[index].grabbed = true;
+        if self.grab.is_none() {
+            self.focus_before_grab = self.keyboard_focus;
+        }
+        self.grab = Some(id);
+        // The keyboard follows the grab: a menu you cannot arrow through is
+        // half a menu.
+        let wl_surface = self.popups[index].surface.clone();
+        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+        self.keyboard
+            .clone()
+            .set_focus(self, Some(wl_surface), serial);
+        self.keyboard_focus = Some(Target::Popup(id));
+        self.emit(Event::PopupGrabbed { id });
+        self.flush();
     }
 
+    /// The client wants the popup somewhere else — an autocomplete list that
+    /// grew, a menu whose anchor moved. Same resolution as `new_popup`, and
+    /// the token comes back so the client knows which request it answers.
     fn reposition_request(
         &mut self,
         surface: PopupSurface,
-        _positioner: PositionerState,
+        positioner: PositionerState,
         token: u32,
     ) {
+        let Some(index) = self.index_of_popup_surface(surface.wl_surface()) else {
+            surface.send_repositioned(token);
+            let _ = surface.send_configure();
+            return;
+        };
+        let root = self.popups[index].root;
+        let base = self.base_of_parent(self.popups[index].parent);
+        let geometry = self.place(&positioner, root, base);
+        surface.with_pending_state(|state| {
+            state.positioner = positioner;
+            state.geometry = geometry;
+        });
         surface.send_repositioned(token);
+        let _ = surface.send_configure();
+
+        let anchor = (base.0 + geometry.loc.x, base.1 + geometry.loc.y);
+        let size = (geometry.size.w.max(0) as u32, geometry.size.h.max(0) as u32);
+        self.popups[index].anchor = anchor;
+        let id = self.popups[index].id;
+        // The buffer's own offset is re-read on the commit that follows; the
+        // move is announced now so a shell has the new place before the new
+        // pixels.
+        let own = popup_geometry_loc(&self.popups[index].surface);
+        let position = (anchor.0 - own.0, anchor.1 - own.1);
+        self.popups[index].position = position;
+        self.emit(Event::PopupMoved { id, position, size });
+        self.flush();
+    }
+
+    /// The client destroyed the popup. It is gone whether or not it was ever
+    /// dismissed, and so is everything hanging off it.
+    fn popup_destroyed(&mut self, surface: PopupSurface) {
+        let Some(index) = self.index_of_popup_surface(surface.wl_surface()) else {
+            return;
+        };
+        let id = self.popups[index].id;
+        self.forget_popup_chain(id, false);
     }
 }
 

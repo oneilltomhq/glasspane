@@ -10,8 +10,11 @@ pub mod browser;
 
 use std::sync::Arc;
 
+
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::shell::xdg::ToplevelSurface;
+
+use crate::texture::Skin;
 
 /// A tenant's identity, stable for its whole life and never reused within a
 /// run.
@@ -35,11 +38,8 @@ pub struct Tenant {
     pub(crate) pid: Option<u32>,
     pub(crate) title: Option<String>,
     pub(crate) app_id: Option<String>,
-    pub(crate) size: (u32, u32),
     pub(crate) configured: Option<(u32, u32)>,
-    pub(crate) texture: Option<Arc<wgpu::Texture>>,
-    pub(crate) generation: u64,
-    pub(crate) acquire_staged: bool,
+    pub(crate) skin: Skin,
     pub(crate) surface: WlSurface,
     pub(crate) toplevel: ToplevelSurface,
 }
@@ -71,7 +71,7 @@ impl Tenant {
     /// Before the first commit this is the size this tenant was configured
     /// with, which the client may not have honoured yet.
     pub fn size(&self) -> (u32, u32) {
-        self.size
+        self.skin.size
     }
 
     /// The size this tenant was last told to be, via
@@ -89,20 +89,20 @@ impl Tenant {
     /// commit lands in the same texture; the handle changes only across an
     /// [`crate::Event::Resized`]. Index it, do not rebind per frame.
     pub fn texture(&self) -> Option<&wgpu::Texture> {
-        self.texture.as_deref()
+        self.skin.texture.as_deref()
     }
 
     /// The texture as a shared handle, for a caller that wants to keep it
     /// alive past the next `&mut Glasspane` call.
     pub fn texture_arc(&self) -> Option<&Arc<wgpu::Texture>> {
-        self.texture.as_ref()
+        self.skin.texture.as_ref()
     }
 
     /// How many commits have landed in this texture. Bumps on every commit
     /// that carried a buffer, including one that re-committed the same
     /// `wl_buffer`.
     pub fn generation(&self) -> u64 {
-        self.generation
+        self.skin.generation
     }
 
     /// Whether the last dma-buf commit's acquire fence was staged as a wait on
@@ -114,7 +114,7 @@ impl Tenant {
     /// on a run that sampled client memory with nothing ordering it. Always
     /// `false` for an `wl_shm` tenant, which has no GPU work to order.
     pub fn acquire_staged(&self) -> bool {
-        self.acquire_staged
+        self.skin.acquire_staged
     }
 
     /// The underlying `wl_surface`, for a caller that needs to reach protocol

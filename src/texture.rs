@@ -53,15 +53,16 @@ pub const IMPORT_USAGE: wgpu::TextureUsages =
 /// it can still choose differently, rather than at commit.
 pub const ACCEPTED_FOURCC: [Fourcc; 2] = [Fourcc::Argb8888, Fourcc::Xrgb8888];
 
-/// A tenant's stable texture.
-pub(crate) fn create_tenant_texture(
+/// A tenant's or a popup's stable texture. `label` is what it is called in a
+/// GPU capture — `tenant#3`, `popup#7`.
+pub(crate) fn create_surface_texture(
     device: &wgpu::Device,
-    id: crate::TenantId,
+    label: &str,
     width: u32,
     height: u32,
 ) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
-        label: Some(&format!("glasspane tenant#{}", id.0)),
+        label: Some(&format!("glasspane {label}")),
         size: wgpu::Extent3d {
             width: width.max(1),
             height: height.max(1),
@@ -147,4 +148,19 @@ pub(crate) fn blit(
         },
     );
     queue.submit([encoder.finish()]);
+}
+
+/// The four fields every surface this crate hands to the shell has: its size,
+/// its texture, how many commits have landed in it, and whether the last one
+/// was fenced.
+///
+/// A toplevel and a popup differ in what they *are* — one is a window, the
+/// other a rectangle floating over one — and not at all in how their pixels
+/// get here, so the commit path is written once against this and both wear it.
+#[derive(Debug, Default)]
+pub(crate) struct Skin {
+    pub(crate) size: (u32, u32),
+    pub(crate) texture: Option<std::sync::Arc<wgpu::Texture>>,
+    pub(crate) generation: u64,
+    pub(crate) acquire_staged: bool,
 }

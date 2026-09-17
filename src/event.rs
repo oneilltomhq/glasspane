@@ -6,6 +6,7 @@
 //! [`Event::Committed`]'s generation to decide whether a texture changed since
 //! it last looked.
 
+use crate::popup::{Parent, PopupId};
 use crate::tenant::TenantId;
 
 /// One thing that happened to one tenant.
@@ -64,6 +65,64 @@ pub enum Event {
         id: TenantId,
         /// The new size in buffer pixels.
         size: (u32, u32),
+    },
+    /// An `xdg_popup` became a popup over one of this compositor's tenants.
+    ///
+    /// It has an id, a parent and a place; like a tenant it has no texture
+    /// until its first [`Event::PopupCommitted`]. A shell that draws panes
+    /// draws this as a second quad hung off the parent pane at `position`.
+    PopupMapped {
+        /// The new popup.
+        id: PopupId,
+        /// Its immediate parent: a tenant, or another popup for a submenu.
+        parent: Parent,
+        /// The tenant at the top of the chain — the pane it belongs over.
+        root: TenantId,
+        /// Its top-left corner in `root`'s buffer pixels. See
+        /// [`crate::Popup::position`].
+        position: (i32, i32),
+        /// The size its positioner asked for, in pixels. The size that
+        /// arrives with the first commit is the one to believe.
+        size: (u32, u32),
+    },
+    /// The popup asked for an explicit grab and was given one: it is modal
+    /// over its root tenant until it is dismissed. See
+    /// [`crate::Popup::has_grab`].
+    PopupGrabbed {
+        /// The popup.
+        id: PopupId,
+    },
+    /// The popup was repositioned — `xdg_popup.reposition`, or its parent
+    /// moved under it.
+    PopupMoved {
+        /// The popup.
+        id: PopupId,
+        /// Its new top-left in its root tenant's buffer pixels.
+        position: (i32, i32),
+        /// The size its new positioner asks for.
+        size: (u32, u32),
+    },
+    /// New pixels landed in this popup's texture. The popup analogue of
+    /// [`Event::Committed`].
+    PopupCommitted {
+        /// The popup.
+        id: PopupId,
+        /// [`crate::Popup::generation`] as of this commit.
+        generation: u64,
+    },
+    /// The popup's buffer size changed, so its texture was recreated. The
+    /// popup analogue of [`Event::Resized`], with the same staleness rule.
+    PopupResized {
+        /// The popup.
+        id: PopupId,
+        /// The new size in buffer pixels.
+        size: (u32, u32),
+    },
+    /// The popup is gone: dismissed, destroyed by its client, or taken down
+    /// with the tenant it belonged to. The [`PopupId`] is never reused.
+    PopupUnmapped {
+        /// The popup that left.
+        id: PopupId,
     },
     /// A commit was refused and dropped. The client is still connected.
     ///

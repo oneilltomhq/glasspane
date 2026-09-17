@@ -21,6 +21,10 @@ pub enum Error {
     /// The caller named a [`crate::TenantId`] that is not (or is no longer) a
     /// live tenant.
     NoSuchTenant(crate::TenantId),
+    /// The caller named a [`crate::PopupId`] that is not (or is no longer) a
+    /// live popup. Routine rather than exceptional: a popup can be dismissed
+    /// between the frame a shell hit-tested and the input it sends.
+    NoSuchPopup(crate::PopupId),
     /// A client committed something this compositor refused. The client is
     /// still connected; the commit was dropped and recorded.
     Rejected(String),
@@ -37,6 +41,7 @@ impl fmt::Display for Error {
             Error::Device(s) => write!(f, "wgpu device: {s}"),
             Error::Dmabuf(e) => write!(f, "dma-buf: {e}"),
             Error::NoSuchTenant(id) => write!(f, "no such tenant: {id}"),
+            Error::NoSuchPopup(id) => write!(f, "no such popup: {id}"),
             Error::Rejected(s) => write!(f, "commit rejected: {s}"),
             Error::Spawn(e) => write!(f, "spawn: {e}"),
             Error::Dispatch(e) => write!(f, "dispatch: {e}"),

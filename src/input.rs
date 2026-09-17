@@ -33,9 +33,54 @@ use smithay::input::keyboard::{FilterResult, Keycode};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
 use smithay::utils::SERIAL_COUNTER;
 
+use crate::popup::PopupId;
 use crate::state::State;
 use crate::tenant::TenantId;
 use crate::{Error, Glasspane, Result};
+
+/// What an input event is aimed at: a tenant, or one of its popups.
+///
+/// The coordinate contract is the same for both — buffer pixels, origin
+/// top-left, in the space of the texture the shell sampled. A shell that
+/// hit-tests a popup quad hands back the pixel on *that* texture, not on the
+/// parent's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    /// A toplevel.
+    Tenant(TenantId),
+    /// A popup over one.
+    Popup(PopupId),
+}
+
+impl From<TenantId> for Target {
+    fn from(id: TenantId) -> Self {
+        Target::Tenant(id)
+    }
+}
+
+impl From<PopupId> for Target {
+    fn from(id: PopupId) -> Self {
+        Target::Popup(id)
+    }
+}
+
+impl std::fmt::Display for Target {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Target::Tenant(id) => write!(f, "{id}"),
+            Target::Popup(id) => write!(f, "{id}"),
+        }
+    }
+}
+
+impl Target {
+    fn missing(self) -> Error {
+        match self {
+            Target::Tenant(id) => Error::NoSuchTenant(id),
+            Target::Popup(id) => Error::NoSuchPopup(id),
+        }
+    }
+}
 
 /// xkb's keycode space is evdev's, offset by 8.
 pub const XKB_EVDEV_OFFSET: u32 = 8;
@@ -94,11 +139,25 @@ impl Glasspane {
         self.pointer_motion(id, x, y)
     }
 
+    /// Put the pointer inside a tenant *or a popup*. See [`Target`].
+    pub fn pointer_enter_at(&mut self, target: Target, x: f64, y: f64) -> Result<()> {
+        self.pointer_motion_at(target, x, y)
+    }
+
     /// Move the pointer within `id`. See the module docs for the coordinate
     /// contract.
     pub fn pointer_motion(&mut self, id: TenantId, x: f64, y: f64) -> Result<()> {
-        let index = self.state.index_of(id).ok_or(Error::NoSuchTenant(id))?;
-        let surface = self.state.tenants[index].surface.clone();
+        self.pointer_motion_at(Target::Tenant(id), x, y)
+    }
+
+    /// Move the pointer within a tenant or a popup, in that surface's own
+    /// buffer pixels.
+    pub fn pointer_motion_at(&mut self, target: Target, x: f64, y: f64) -> Result<()> {
+        let slot = self
+            .state
+            .slot_of_target(target)
+            .ok_or_else(|| target.missing())?;
+        let surface = self.state.surface_of(slot);
         let serial = SERIAL_COUNTER.next_serial();
         let time = self.state.now_ms();
         let pointer = self.state.pointer.clone();
@@ -117,7 +176,7 @@ impl Glasspane {
             },
         );
         pointer.frame(&mut self.state);
-        self.state.pointer_focus = Some(id);
+        self.state.pointer_focus = Some(target);
         self.state.flush();
         Ok(())
     }
@@ -150,6 +209,23 @@ impl Glasspane {
     /// click is the last [`Glasspane::pointer_motion`], as in the protocol, so
     /// a click is always motion-then-button and never a position of its own.
     pub fn pointer_button(&mut self, code: u32, state: KeyState) {
+        // A grabbing popup is modal: a press that is not inside its chain
+        // dismisses it and is **swallowed**, exactly as a press outside a menu
+        // on a desktop closes the menu without also activating what was under
+        // the cursor. Without this a `<select>` menu never learns it has been
+        // dismissed and Chromium waits for a `popup_done` that never comes.
+        if state == KeyState::Pressed {
+            if let Some(grab) = self.state.grab {
+                let inside = match self.state.pointer_focus {
+                    Some(Target::Popup(p)) => self.state.in_chain(p, grab),
+                    _ => false,
+                };
+                if !inside {
+                    self.state.dismiss_grab();
+                    return;
+                }
+            }
+        }
         let serial = SERIAL_COUNTER.next_serial();
         let time = self.state.now_ms();
         let pointer = self.state.pointer.clone();
@@ -204,24 +280,46 @@ impl Glasspane {
     /// surface has its keyboard focus. Which one is the shell's decision, made
     /// here.
     pub fn set_keyboard_focus(&mut self, id: Option<TenantId>) -> Result<()> {
-        let surface = match id {
-            Some(id) => {
-                let index = self.state.index_of(id).ok_or(Error::NoSuchTenant(id))?;
-                Some(self.state.tenants[index].surface.clone())
+        self.set_keyboard_focus_at(id.map(Target::Tenant))
+    }
+
+    /// Give keyboard focus to a tenant, a popup, or nothing.
+    pub fn set_keyboard_focus_at(&mut self, target: Option<Target>) -> Result<()> {
+        let surface = match target {
+            Some(target) => {
+                let slot = self
+                    .state
+                    .slot_of_target(target)
+                    .ok_or_else(|| target.missing())?;
+                Some(self.state.surface_of(slot))
             }
             None => None,
         };
         let serial = SERIAL_COUNTER.next_serial();
         let keyboard = self.state.keyboard.clone();
         keyboard.set_focus(&mut self.state, surface, serial);
-        self.state.keyboard_focus = id;
+        self.state.keyboard_focus = target;
         self.state.flush();
         Ok(())
     }
 
-    /// Which tenant has keyboard focus.
+    /// Which tenant has keyboard focus. `None` while a popup holds it — see
+    /// [`Glasspane::keyboard_focus_at`], which says either way.
     pub fn keyboard_focus(&self) -> Option<TenantId> {
+        match self.state.keyboard_focus {
+            Some(Target::Tenant(id)) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// What has keyboard focus: a tenant, a popup, or nothing.
+    pub fn keyboard_focus_at(&self) -> Option<Target> {
         self.state.keyboard_focus
+    }
+
+    /// What the pointer is over, as of the last motion.
+    pub fn pointer_focus_at(&self) -> Option<Target> {
+        self.state.pointer_focus
     }
 
     /// Send one key to the focused tenant.
@@ -232,9 +330,20 @@ impl Glasspane {
     /// [`Glasspane::set_keyboard_focus`], and a caller that has already set
     /// focus passes `None`.
     pub fn keyboard_key(&mut self, to: Option<TenantId>, evdev: u32, state: KeyState) -> Result<()> {
-        if let Some(id) = to {
-            if self.state.keyboard_focus != Some(id) {
-                self.set_keyboard_focus(Some(id))?;
+        self.keyboard_key_at(to.map(Target::Tenant), evdev, state)
+    }
+
+    /// Send one key to a tenant or a popup, moving focus there first if `to`
+    /// is given.
+    pub fn keyboard_key_at(
+        &mut self,
+        to: Option<Target>,
+        evdev: u32,
+        state: KeyState,
+    ) -> Result<()> {
+        if let Some(target) = to {
+            if self.state.keyboard_focus != Some(target) {
+                self.set_keyboard_focus_at(Some(target))?;
             }
         }
         let serial = SERIAL_COUNTER.next_serial();

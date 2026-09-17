@@ -92,6 +92,7 @@ mod convert;
 mod error;
 pub mod event;
 pub mod input;
+pub mod popup;
 pub mod registry;
 mod state;
 pub mod tenant;
@@ -100,7 +101,8 @@ pub mod texture;
 pub use acquire::AcquireReport;
 pub use error::{Error, Result};
 pub use event::Event;
-pub use input::KeyState;
+pub use input::{KeyState, Target};
+pub use popup::{Parent, Popup, PopupId};
 pub use tenant::{Tenant, TenantId};
 
 /// The smithay this crate is built against, re-exported so a caller naming
@@ -384,6 +386,10 @@ impl Glasspane {
             acquire,
             tenants: Vec::new(),
             next_tenant: 0,
+            popups: Vec::new(),
+            next_popup: 0,
+            grab: None,
+            focus_before_grab: None,
             events: Default::default(),
             pending_callbacks: Vec::new(),
             default_size: caps.default_size,
@@ -444,6 +450,10 @@ impl Glasspane {
         self.event_loop
             .dispatch(timeout, &mut self.state)
             .map_err(|e| Error::Dispatch(e.to_string()))?;
+        // A client that disconnected mid-menu never sends `destroy`, so the
+        // popup list is swept here rather than waiting for a request that is
+        // not coming.
+        self.state.prune_popups();
         self.state.flush();
         Ok(())
     }
@@ -475,6 +485,48 @@ impl Glasspane {
     /// One tenant by id.
     pub fn tenant(&self, id: TenantId) -> Option<&Tenant> {
         self.state.tenants.iter().find(|t| t.id == id)
+    }
+
+    /// Every live popup, in no particular order.
+    ///
+    /// Popups are **not** tenants and never appear in
+    /// [`Glasspane::tenants`]: a shell that keeps a row of panes must not find
+    /// a `<select>` menu in it. Each one carries the tenant it belongs over
+    /// and where, in that tenant's buffer pixels — see [`Popup`].
+    pub fn popups(&self) -> impl ExactSizeIterator<Item = &Popup> {
+        self.state.popups.iter()
+    }
+
+    /// One popup by id.
+    pub fn popup(&self, id: PopupId) -> Option<&Popup> {
+        self.state.popups.iter().find(|p| p.id == id)
+    }
+
+    /// The popup currently holding a grab, if any: the one a click outside
+    /// dismisses.
+    pub fn grabbing_popup(&self) -> Option<PopupId> {
+        self.state.grab
+    }
+
+    /// Dismiss a popup: `xdg_popup.popup_done` to the client, and gone from
+    /// [`Glasspane::popups`] — along with anything hanging off it — as of this
+    /// call.
+    ///
+    /// The shell does not normally need this: a pointer button pressed outside
+    /// a grabbing popup already does it (see
+    /// [`Glasspane::pointer_button`]). It is here for the cases that are not a
+    /// click — Escape, a pane being closed, the camera leaving.
+    pub fn dismiss_popup(&mut self, id: PopupId) -> Result<()> {
+        if self.state.index_of_popup(id).is_none() {
+            return Err(Error::NoSuchPopup(id));
+        }
+        self.state.forget_popup_chain(id, true);
+        Ok(())
+    }
+
+    /// Dismiss every popup belonging to a tenant.
+    pub fn dismiss_popups_of(&mut self, id: TenantId) {
+        self.state.close_popups_of(id, true);
     }
 
     /// Drain the event queue.
