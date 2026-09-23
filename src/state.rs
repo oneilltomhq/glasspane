@@ -32,6 +32,9 @@ use smithay::wayland::compositor::{
 };
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier, get_dmabuf};
 use smithay::wayland::selection::SelectionHandler;
+use smithay::wayland::selection::primary_selection::{
+    PrimarySelectionHandler, PrimarySelectionState, set_primary_focus,
+};
 use smithay::wayland::selection::data_device::{
     DataDeviceHandler, DataDeviceState, ServerDndGrabHandler, set_data_device_focus,
 };
@@ -107,6 +110,7 @@ pub struct State {
     pub(crate) dmabuf_state: DmabufState,
     pub(crate) dmabuf_global: Option<DmabufGlobal>,
     pub(crate) data_device_state: DataDeviceState,
+    pub(crate) primary_selection_state: PrimarySelectionState,
     pub(crate) seat_state: SeatState<Self>,
     /// The seat itself is driven through `keyboard` and `pointer`; it is held
     /// because dropping it destroys the `wl_seat` global.
@@ -1072,7 +1076,8 @@ impl SeatHandler for State {
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
         let dh = self.dh.clone();
         let client = focused.and_then(|s| dh.get_client(s.id()).ok());
-        set_data_device_focus(&dh, seat, client);
+        set_data_device_focus(&dh, seat, client.clone());
+        set_primary_focus(&dh, seat, client);
     }
 
     /// What the focused client wants the pointer to look like.
@@ -1094,6 +1099,12 @@ impl DataDeviceHandler for State {
     }
 }
 
+impl PrimarySelectionHandler for State {
+    fn primary_selection_state(&self) -> &PrimarySelectionState {
+        &self.primary_selection_state
+    }
+}
+
 impl smithay::wayland::selection::data_device::ClientDndGrabHandler for State {}
 impl ServerDndGrabHandler for State {}
 
@@ -1106,6 +1117,7 @@ smithay::delegate_xdg_shell!(State);
 smithay::delegate_xdg_decoration!(State);
 smithay::delegate_seat!(State);
 smithay::delegate_data_device!(State);
+smithay::delegate_primary_selection!(State);
 smithay::delegate_output!(State);
 
 /// A seat and the two handles this crate drives it through.

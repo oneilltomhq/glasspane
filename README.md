@@ -187,10 +187,16 @@ v0.1. shm and single-plane `ARGB8888`/`XRGB8888` dma-buf, `xdg_shell` toplevels
 and popups, server-side decorations refused politely, pointer, keyboard and
 axis injection.
 
+The clipboard (`wl_data_device`) and the primary selection
+(`zwp_primary_selection_device_manager_v1`) are relayed between tenants: copy
+in one and paste in another, or select in one and middle-click in another. The
+selection follows keyboard focus, so a tenant is offered it once it has the
+keyboard.
+
 Not yet: subsurfaces, damage tracking
-(an shm commit uploads the whole buffer), multi-plane formats, clipboard and
-drag-and-drop beyond the plumbing to accept them, `wp_viewport`, fractional
-scale, and KMS scanout of the composited result.
+(an shm commit uploads the whole buffer), multi-plane formats, drag-and-drop
+beyond the plumbing to accept it, `wp_viewport`, fractional scale, and KMS
+scanout of the composited result.
 
 ## Publishing
 

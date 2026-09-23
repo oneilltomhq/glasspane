@@ -461,3 +461,131 @@ fn a_client_that_is_never_ticked_stalls_after_one_frame() {
         .count();
     assert_eq!(commits, 1, "the client committed {commits} times unticked");
 }
+
+/// `wl-copy` and `wl-paste` from wl-clipboard, or `None` if either is missing.
+///
+/// Neither is a dev-dependency a crate can declare, so a machine without them
+/// skips, and says so, rather than failing.
+fn wl_clipboard() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let find = |name: &str| {
+        std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|d| d.join(name))
+                .find(|p| p.is_file())
+        })
+    };
+    match (find("wl-copy"), find("wl-paste")) {
+        (Some(c), Some(p)) => Some((c, p)),
+        _ => {
+            eprintln!("SKIP: wl-clipboard (wl-copy, wl-paste) is not installed");
+            None
+        }
+    }
+}
+
+/// A wl-clipboard process on this pane's socket, and nothing of the session's.
+fn wl_clipboard_command(program: &std::path::Path, pane: &Glasspane) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
+    cmd.env("WAYLAND_DISPLAY", pane.socket_name())
+        .env_remove("WAYLAND_SOCKET")
+        .env_remove("DISPLAY")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    cmd
+}
+
+/// Pump until a new toplevel maps, and give it the keyboard.
+///
+/// wl-clipboard has no data-control protocol to use here, so it does what any
+/// client must: map a surface, wait for keyboard focus, and use that serial.
+fn map_and_focus(pane: &mut Glasspane, events: &mut Vec<Event>, what: &str) -> TenantId {
+    let from = events.len();
+    let mut id = None;
+    pump(pane, events, Duration::from_secs(10), |_, evs| {
+        id = evs[from..].iter().find_map(|e| match e {
+            Event::Mapped { id, .. } => Some(*id),
+            _ => None,
+        });
+        id.is_some()
+    });
+    let id = id.unwrap_or_else(|| panic!("{what} never mapped a toplevel: {events:?}"));
+    pane.set_keyboard_focus(Some(id)).unwrap();
+    id
+}
+
+/// Copy with one wl-clipboard client, paste with another, and return what the
+/// paste printed.
+fn copy_then_paste(tag: &str, flag: &[&str], text: &str) -> Option<String> {
+    let (copy, paste) = wl_clipboard()?;
+    let (_adapter, device, queue) = gpu()?;
+    let mut pane = start(tag, None, device, queue);
+    let mut events = Vec::new();
+
+    // --foreground so the process is ours to kill; by default wl-copy forks
+    // and serves the selection from a child this test would leak.
+    let mut copier = wl_clipboard_command(&copy, &pane)
+        .arg("--foreground")
+        .args(flag)
+        .arg(text)
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn wl-copy");
+    map_and_focus(&mut pane, &mut events, "wl-copy");
+    // wl-copy sets the selection on keyboard enter, then unmaps its surface.
+    // The selection outlives the surface; the source is what serves it.
+    pump(&mut pane, &mut events, Duration::from_secs(5), |_, evs| {
+        evs.iter().any(|e| matches!(e, Event::Unmapped { .. }))
+    });
+
+    let mut paster = wl_clipboard_command(&paste, &pane)
+        .arg("--no-newline")
+        .args(flag)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn wl-paste");
+    let mut out = paster.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = std::io::Read::read_to_string(&mut out, &mut s);
+        let _ = tx.send(s);
+    });
+    map_and_focus(&mut pane, &mut events, "wl-paste");
+    // The transfer is client to client, but every request of it goes through
+    // the compositor, so the pane must keep dispatching until the pipe closes.
+    let mut got = None;
+    pump(&mut pane, &mut events, Duration::from_secs(10), |_, _| {
+        got = rx.try_recv().ok();
+        got.is_some()
+    });
+
+    let _ = copier.kill();
+    let _ = copier.wait();
+    let _ = paster.kill();
+    let status = paster.wait().unwrap();
+    let mut err = String::new();
+    let _ = std::io::Read::read_to_string(paster.stderr.as_mut().unwrap(), &mut err);
+    Some(got.unwrap_or_else(|| panic!("wl-paste never finished ({status}): {err}; {events:?}")))
+}
+
+/// **A primary selection crosses from one tenant to another.**
+///
+/// Select-then-middle-click, as two wl-clipboard processes: one owns the
+/// `zwp_primary_selection_v1` selection, a second one, focused afterwards, is
+/// offered it and reads it. Without the primary selection global wl-paste
+/// refuses outright; without `set_primary_focus` on a focus change it is
+/// never offered anything.
+#[test]
+fn a_primary_selection_crosses_between_tenants() {
+    if let Some(got) = copy_then_paste("primary", &["--primary"], "hello") {
+        assert_eq!(got, "hello");
+    }
+}
+
+/// **The clipboard crosses from one tenant to another**, the same way.
+#[test]
+fn a_clipboard_selection_crosses_between_tenants() {
+    if let Some(got) = copy_then_paste("clipboard", &[], "hello clipboard") {
+        assert_eq!(got, "hello clipboard");
+    }
+}

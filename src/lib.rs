@@ -123,6 +123,7 @@ use smithay::utils::Transform;
 use smithay::wayland::compositor::CompositorState;
 use smithay::wayland::dmabuf::DmabufState;
 use smithay::wayland::selection::data_device::DataDeviceState;
+use smithay::wayland::selection::primary_selection::PrimarySelectionState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
 use smithay::wayland::shm::ShmState;
@@ -259,6 +260,7 @@ impl Glasspane {
         let xdg_decoration_state = XdgDecorationState::new::<State>(&dh);
         let shm_state = ShmState::new::<State>(&dh, vec![]);
         let data_device_state = DataDeviceState::new::<State>(&dh);
+        let primary_selection_state = PrimarySelectionState::new::<State>(&dh);
         let mut dmabuf_state = DmabufState::new();
 
         // The advertisement is derived from the device, never hardcoded: a
@@ -377,6 +379,7 @@ impl Glasspane {
             dmabuf_state,
             dmabuf_global,
             data_device_state,
+            primary_selection_state,
             seat_state,
             seat,
             keyboard,

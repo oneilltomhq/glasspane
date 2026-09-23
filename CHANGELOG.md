@@ -23,6 +23,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   keyboard at a popup in its own buffer pixels. The `TenantId` entry points
   are unchanged.
 - `Error::NoSuchPopup`.
+- Primary selection: the `zwp_primary_selection_device_manager_v1` global,
+  offered to whichever tenant has the keyboard, as the clipboard already was.
+  Select in one tenant and middle-click in another and the text crosses.
 
 ### Changed
 
