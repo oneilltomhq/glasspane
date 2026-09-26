@@ -34,11 +34,22 @@ pollster = { version = "0.4", optional = true }
 # workspace member because it is the same `State` in a different mode, and
 # `State` is `pub(crate)` on purpose.
 daemon = ["dep:pollster"]
+# `glasspane::remote`: the shell side of that socket, with the in-process
+# facade's method names, doing the import, acquire wait and blit itself.
+remote = []
 
 [[bin]]
 name = "glasspane-daemon"
 path = "src/bin/glasspane-daemon.rs"
 required-features = ["daemon"]
+
+[[example]]
+name = "remote_shot"
+required-features = ["remote"]
+
+[[test]]
+name = "daemon"
+required-features = ["daemon", "remote"]
 
 [dependencies.smithay]
 version = "0.7"
