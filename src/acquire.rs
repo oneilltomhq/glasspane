@@ -136,8 +136,23 @@ impl AcquireGate {
                  ordering it is not a fallback."
             )
         })?;
+        self.wait_on(key, fence.sync_file, fence.already_signalled)
+    }
+
+    /// Stage a wait on a `sync_file` somebody else exported — the daemon, at
+    /// the client's commit — rather than exporting one here.
+    ///
+    /// Same pool, same per-buffer semaphore, same ledger as
+    /// [`AcquireGate::wait_for`]; the only difference is who ran the ioctl.
+    /// `already_signalled` is the exporter's reading, taken when it exported.
+    pub fn wait_on(
+        &mut self,
+        key: BufferKey,
+        fence: sync::SyncFile,
+        already_signalled: bool,
+    ) -> Result<(), String> {
         self.exports += 1;
-        if fence.already_signalled {
+        if already_signalled {
             self.already_signalled += 1;
         }
 
@@ -172,7 +187,7 @@ impl AcquireGate {
                 .map_err(|e| format!("retire poll before acquire import: {e:?}"))?;
         }
         slot.semaphore
-            .import(fence.sync_file)
+            .import(fence)
             .map_err(|e| format!("importing a client sync_file: {e}"))?;
         slot.semaphore
             .wait_on_next_submit(&self.queue, WAIT_STAGE)

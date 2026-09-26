@@ -89,13 +89,57 @@ pub(crate) fn buffer_key(buffer: &WlBuffer) -> BufferKey {
     BufferKey(h.finish())
 }
 
+/// The in-process sink: a borrowed device, the import-once registry and the
+/// acquire gate. This is what every commit went into before the daemon
+/// existed, and what [`crate::Glasspane`] still uses.
+pub(crate) struct Gpu {
+    pub(crate) device: wgpu::Device,
+    pub(crate) queue: wgpu::Queue,
+    pub(crate) registry: Registry,
+    pub(crate) acquire: Option<AcquireGate>,
+}
+
+/// What happens to a committed buffer.
+///
+/// The compositor half — configure, frame callbacks, xdg-shell, the seat,
+/// everything else in [`State`] — is identical in both modes. The only thing
+/// that differs is the last step of a commit: import-and-blit into a texture
+/// here, or describe-and-export for another process to import.
+pub(crate) enum Sink {
+    /// Import and blit, in this process, on the caller's device.
+    Gpu(Gpu),
+    /// No device: every commit becomes an [`crate::daemon::Outgoing`] in this
+    /// queue, and so does every event, in one order.
+    #[cfg(feature = "daemon")]
+    Export(std::collections::VecDeque<crate::daemon::Outgoing>),
+}
+
+impl Sink {
+    pub(crate) fn gpu(&self) -> Option<&Gpu> {
+        match self {
+            Sink::Gpu(g) => Some(g),
+            #[cfg(feature = "daemon")]
+            Sink::Export(_) => None,
+        }
+    }
+
+    pub(crate) fn gpu_mut(&mut self) -> Option<&mut Gpu> {
+        match self {
+            Sink::Gpu(g) => Some(g),
+            #[cfg(feature = "daemon")]
+            Sink::Export(_) => None,
+        }
+    }
+}
+
 /// Everything the compositor owns. One struct, because calloop dispatches
 /// against exactly one.
 pub struct State {
     pub(crate) start: Instant,
     pub(crate) dh: DisplayHandle,
-    pub(crate) device: wgpu::Device,
-    pub(crate) queue: wgpu::Queue,
+    /// Where committed buffers go: into textures on a device, or out of the
+    /// process to whoever does have one.
+    pub(crate) sink: Sink,
 
     pub(crate) compositor_state: CompositorState,
     pub(crate) xdg_shell_state: XdgShellState,
@@ -125,8 +169,6 @@ pub struct State {
     #[allow(dead_code)]
     pub(crate) output: Output,
 
-    pub(crate) registry: Registry,
-    pub(crate) acquire: Option<AcquireGate>,
     pub(crate) tenants: Vec<Tenant>,
     pub(crate) next_tenant: u64,
     pub(crate) popups: Vec<Popup>,
@@ -246,6 +288,14 @@ impl State {
         // limit. Dropping the *oldest* is the right end to drop from: the
         // newest events are the ones that still describe the present.
         const CAP: usize = 4096;
+        // A daemon has one ordered stream for the shell — events and exported
+        // buffers interleaved — so that a Mapped can never arrive after the
+        // Commit it precedes.
+        #[cfg(feature = "daemon")]
+        if let Sink::Export(out) = &mut self.sink {
+            out.push_back(crate::daemon::Outgoing::Event(event));
+            return;
+        }
         if self.events.len() >= CAP {
             self.events.pop_front();
         }
@@ -339,7 +389,10 @@ impl State {
             Slot::Tenant(i) => format!("tenant#{}", self.tenants[i].id.0),
             Slot::Popup(i) => format!("popup#{}", self.popups[i].id.0),
         };
-        let tex = texture::create_surface_texture(&self.device, &label, width, height);
+        let Some(gpu) = self.sink.gpu() else {
+            return;
+        };
+        let tex = texture::create_surface_texture(&gpu.device, &label, width, height);
         let skin = self.skin_mut(slot);
         skin.texture = Some(Arc::new(tex));
         skin.size = (width, height);
@@ -359,6 +412,18 @@ impl State {
     /// One committed buffer becomes texels.
     fn absorb_buffer(&mut self, slot: Slot, buffer: &WlBuffer) {
         let key = buffer_key(buffer);
+
+        #[cfg(feature = "daemon")]
+        if matches!(self.sink, Sink::Export(_)) {
+            if let Err(why) = self.export_buffer(slot, key, buffer) {
+                let id = match slot {
+                    Slot::Tenant(i) => Some(self.tenants[i].id),
+                    Slot::Popup(i) => Some(self.popups[i].root),
+                };
+                self.reject(id, why);
+            }
+            return;
+        }
 
         let result = match get_dmabuf(buffer) {
             Ok(dmabuf) => self.absorb_dmabuf(slot, key, &dmabuf.clone()),
@@ -404,7 +469,11 @@ impl State {
         // **The acquire wait goes first**, before anything on this queue can
         // touch the buffer: the next submit then carries it, and the next
         // submit is the blit two dozen lines below.
-        if let Some(gate) = self.acquire.as_mut() {
+        let gpu = self
+            .sink
+            .gpu_mut()
+            .expect("absorb_dmabuf runs only with a device");
+        if let Some(gate) = gpu.acquire.as_mut() {
             let plane = dmabuf
                 .handles()
                 .next()
@@ -416,9 +485,13 @@ impl State {
         }
 
         let (width, height) = (dmabuf.width(), dmabuf.height());
-        let device = self.device.clone();
         let described = crate::convert::describe(dmabuf)?;
-        let (_id, src, _imported) = self
+        let gpu = self
+            .sink
+            .gpu_mut()
+            .expect("absorb_dmabuf runs only with a device");
+        let device = gpu.device.clone();
+        let (_id, src, _imported) = gpu
             .registry
             .get_or_import(key, || {
                 wgpu_dmabuf::import(&device, &described, texture::IMPORT_USAGE)
@@ -431,7 +504,11 @@ impl State {
             .texture
             .clone()
             .expect("ensure_texture just set it");
-        texture::blit(&self.device, &self.queue, &src, &dst, width, height);
+        let gpu = self
+            .sink
+            .gpu()
+            .expect("absorb_dmabuf runs only with a device");
+        texture::blit(&gpu.device, &gpu.queue, &src, &dst, width, height);
         Ok(())
     }
 
@@ -473,7 +550,8 @@ impl State {
             .texture
             .clone()
             .expect("ensure_texture just set it");
-        texture::upload_shm(&self.queue, &dst, &bytes, stride, w, h);
+        let gpu = self.sink.gpu().expect("absorb_shm runs only with a device");
+        texture::upload_shm(&gpu.queue, &dst, &bytes, stride, w, h);
         Ok(())
     }
 }
@@ -779,9 +857,16 @@ impl CompositorHandler for State {
 impl BufferHandler for State {
     fn buffer_destroyed(&mut self, buffer: &WlBuffer) {
         let key = buffer_key(buffer);
-        self.registry.forget(key);
-        if let Some(gate) = self.acquire.as_mut() {
-            gate.forget(key);
+        match &mut self.sink {
+            Sink::Gpu(gpu) => {
+                gpu.registry.forget(key);
+                if let Some(gate) = gpu.acquire.as_mut() {
+                    gate.forget(key);
+                }
+            }
+            // The shell holds the import, so the shell is told to drop it.
+            #[cfg(feature = "daemon")]
+            Sink::Export(out) => out.push_back(crate::daemon::Outgoing::BufferGone(key)),
         }
     }
 }
@@ -1137,6 +1222,58 @@ impl State {
             .map_err(|e| crate::Error::Socket(format!("seat keyboard: {e}")))?;
         let pointer = seat.add_pointer();
         Ok((seat, keyboard, pointer))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Daemon mode: export instead of import
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "daemon")]
+impl State {
+    /// The daemon's end of a commit: everything a process with a device needs
+    /// to import this buffer, and no import.
+    ///
+    /// The plane fd is a dup (the client keeps its own), and the acquire
+    /// fence is exported *here*, at commit time, because that is the moment
+    /// the client's implicit write fences describe this frame. The shell
+    /// waits on it before its blit exactly as the in-process path does.
+    ///
+    /// Two refusals, both the spike's and both stated: **`wl_shm` buffers
+    /// are rejected** (there is no fd-only way to hand one over that is not a
+    /// second copy path to maintain), and **popups are not exported**.
+    fn export_buffer(
+        &mut self,
+        slot: Slot,
+        key: BufferKey,
+        buffer: &WlBuffer,
+    ) -> Result<(), String> {
+        let Slot::Tenant(index) = slot else {
+            return Err("popups are not exported in daemon mode (spike)".into());
+        };
+        let dmabuf = get_dmabuf(buffer)
+            .map_err(|_| {
+                "wl_shm buffers are not exported in daemon mode (spike): only dma-buf crosses \
+                 the socket"
+                    .to_string()
+            })?
+            .clone();
+        let described = crate::convert::describe(&dmabuf)?;
+        let fence = crate::daemon::export_fence(&described);
+        let tenant = &mut self.tenants[index];
+        tenant.skin.size = (described.width, described.height);
+        tenant.skin.generation += 1;
+        let commit = crate::daemon::Commit {
+            id: tenant.id,
+            generation: tenant.skin.generation,
+            key,
+            dmabuf: described,
+            fence,
+        };
+        if let Sink::Export(out) = &mut self.sink {
+            out.push_back(crate::daemon::Outgoing::Commit(commit));
+        }
+        Ok(())
     }
 }
 

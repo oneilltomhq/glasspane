@@ -89,14 +89,20 @@
 
 pub mod acquire;
 mod convert;
+#[cfg(feature = "daemon")]
+pub mod daemon;
 mod error;
 pub mod event;
 pub mod input;
 pub mod popup;
 pub mod registry;
+#[cfg(feature = "remote")]
+pub mod remote;
 mod state;
 pub mod tenant;
 pub mod texture;
+#[cfg(any(feature = "daemon", feature = "remote"))]
+mod wire;
 
 pub use acquire::AcquireReport;
 pub use error::{Error, Result};
@@ -249,20 +255,6 @@ impl Glasspane {
     /// belongs to them, so the shell can sample them with no sharing, no
     /// second device and no cross-device fence.
     pub fn new(device: wgpu::Device, queue: wgpu::Queue, caps: Caps<'_>) -> Result<Self> {
-        let event_loop: EventLoop<'static, State> =
-            EventLoop::try_new().map_err(|e| Error::Socket(format!("calloop: {e}")))?;
-        let display: Display<State> =
-            Display::new().map_err(|e| Error::Socket(format!("wl_display: {e}")))?;
-        let dh = display.handle();
-
-        let compositor_state = CompositorState::new::<State>(&dh);
-        let xdg_shell_state = XdgShellState::new::<State>(&dh);
-        let xdg_decoration_state = XdgDecorationState::new::<State>(&dh);
-        let shm_state = ShmState::new::<State>(&dh, vec![]);
-        let data_device_state = DataDeviceState::new::<State>(&dh);
-        let primary_selection_state = PrimarySelectionState::new::<State>(&dh);
-        let mut dmabuf_state = DmabufState::new();
-
         // The advertisement is derived from the device, never hardcoded: a
         // modifier list that is a guess is a list clients will allocate
         // against and this compositor will then refuse.
@@ -280,128 +272,14 @@ impl Glasspane {
                 None
             }
         };
-        let fenced = acquire.is_some();
-        let dmabuf_global = match caps.adapter {
-            Some(adapter) if fenced || caps.allow_unfenced_dmabuf => {
-                let formats = shareable_formats(adapter)?;
-                if formats.is_empty() {
-                    None
-                } else {
-                    Some(dmabuf_state.create_global::<State>(&dh, formats))
-                }
-            }
-            _ => None,
-        };
-
-        // One output, sized to the default tenant size. It exists because a
-        // client with no `wl_output` at all cannot work out its scale and some
-        // toolkits refuse to map; its geometry is not placement policy,
-        // because nothing is ever placed on it.
-        let output = Output::new(
-            "glasspane".to_string(),
-            PhysicalProperties {
-                size: (0, 0).into(),
-                subpixel: Subpixel::Unknown,
-                make: "glasspane".into(),
-                model: "headless".into(),
-            },
-        );
-        let mode = OutputMode {
-            size: (caps.default_size.0 as i32, caps.default_size.1 as i32).into(),
-            refresh: 60_000,
-        };
-        output.change_current_state(Some(mode), Some(Transform::Normal), None, Some((0, 0).into()));
-        output.set_preferred(mode);
-        output.create_global::<State>(&dh);
-
-        let mut seat_state = smithay::input::SeatState::<State>::new();
-        let xkb = match caps.xkb_layout.as_deref() {
-            Some(layout) => XkbConfig {
-                layout,
-                ..Default::default()
-            },
-            None => XkbConfig::default(),
-        };
-        let (seat, keyboard, pointer) =
-            State::make_seat(&mut seat_state, &dh, &caps.seat_name, xkb)?;
-
-        let socket = match &caps.socket_name {
-            Some(name) => ListeningSocketSource::with_name(name),
-            None => ListeningSocketSource::new_auto(),
-        }
-        .map_err(|e| Error::Socket(format!("bind: {e}")))?;
-        let socket_name = socket.socket_name().to_os_string();
-
-        let handle = event_loop.handle();
-        handle
-            .insert_source(socket, move |stream, _, state: &mut State| {
-                // The pid is read here, once, from the socket's peer
-                // credentials: it is the only thing that ties a tenant back to
-                // the Child the caller holds.
-                let pid = peer_pid(&stream);
-                let data = Arc::new(ClientState {
-                    pid,
-                    ..Default::default()
-                });
-                if let Err(e) = state.dh.insert_client(stream, data) {
-                    state.reject(None, format!("insert_client: {e}"));
-                }
-            })
-            .map_err(|e| Error::Socket(format!("insert socket source: {e}")))?;
-
-        handle
-            .insert_source(
-                Generic::new(display, Interest::READ, Mode::Level),
-                |_, display, state: &mut State| {
-                    // SAFETY: the display is never dropped out of the source.
-                    unsafe { display.get_mut().dispatch_clients(state)? };
-                    // Every answer to a client request — a registry global, a
-                    // `wl_display.sync` reply, an `xdg_surface.configure` — is
-                    // a buffered write, and the next thing this loop does is
-                    // block in poll. A client whose entire startup is
-                    // roundtrips (Chromium is one) reaches its timeout with
-                    // zero toplevels without this line.
-                    state.flush();
-                    Ok(PostAction::Continue)
-                },
-            )
-            .map_err(|e| Error::Socket(format!("insert display source: {e}")))?;
-
-        let state = State {
-            start: Instant::now(),
-            dh,
+        let advertise = acquire.is_some() || caps.allow_unfenced_dmabuf;
+        let sink = state::Sink::Gpu(state::Gpu {
             device,
             queue,
-            compositor_state,
-            xdg_shell_state,
-            xdg_decoration_state,
-            shm_state,
-            dmabuf_state,
-            dmabuf_global,
-            data_device_state,
-            primary_selection_state,
-            seat_state,
-            seat,
-            keyboard,
-            pointer,
-            output,
             registry: registry::Registry::new(),
             acquire,
-            tenants: Vec::new(),
-            next_tenant: 0,
-            popups: Vec::new(),
-            next_popup: 0,
-            grab: None,
-            focus_before_grab: None,
-            events: Default::default(),
-            pending_callbacks: Vec::new(),
-            default_size: caps.default_size,
-            keyboard_focus: None,
-            pointer_focus: None,
-            ticks: 0,
-            callbacks_sent: 0,
-        };
-
+        });
+        let (event_loop, state, socket_name) = build(&caps, sink, advertise)?;
         Ok(Self {
             event_loop,
             state,
@@ -580,7 +458,7 @@ impl Glasspane {
     /// A harness that reports `waits` without `already_signalled` is reporting
     /// a gate that passes for a reason unrelated to what it measures.
     pub fn acquire_report(&self) -> Option<AcquireReport> {
-        self.state.acquire.as_ref().map(|g| g.report())
+        self.gpu().acquire.as_ref().map(|g| g.report())
     }
 
     /// How many dma-buf imports have happened, and how many commits hit the
@@ -590,8 +468,8 @@ impl Glasspane {
     /// one buffer must move the second and not the first.
     pub fn import_stats(&self) -> (u64, u64) {
         (
-            self.state.registry.import_count(),
-            self.state.registry.cache_hit_count(),
+            self.gpu().registry.import_count(),
+            self.gpu().registry.cache_hit_count(),
         )
     }
 
@@ -602,12 +480,20 @@ impl Glasspane {
 
     /// The `wgpu::Device` every tenant texture belongs to.
     pub fn device(&self) -> &wgpu::Device {
-        &self.state.device
+        &self.gpu().device
     }
 
     /// The queue the acquire waits are staged on.
     pub fn queue(&self) -> &wgpu::Queue {
-        &self.state.queue
+        &self.gpu().queue
+    }
+
+    /// The in-process facade is only ever built over a device.
+    fn gpu(&self) -> &state::Gpu {
+        self.state
+            .sink
+            .gpu()
+            .expect("an in-process Glasspane always has a device")
     }
 }
 
@@ -617,10 +503,160 @@ impl Drop for Glasspane {
     /// leaving it to field order is the difference between a clean exit and
     /// destroying semaphores on a dead device.
     fn drop(&mut self) {
-        if let Some(gate) = self.state.acquire.as_mut() {
+        if let Some(gate) = self.state.sink.gpu_mut().and_then(|g| g.acquire.as_mut()) {
             gate.shutdown();
         }
     }
+}
+
+/// Everything a compositor is apart from what it does with a committed
+/// buffer: the display, every global, the seat, the output and the socket.
+///
+/// Shared by the in-process [`Glasspane`] and the daemon, which differ only in
+/// `sink`. `advertise_dmabuf` is the caller's verdict on whether it can
+/// honour a dma-buf at all; the formats themselves still come from
+/// `caps.adapter`.
+pub(crate) fn build(
+    caps: &Caps<'_>,
+    sink: state::Sink,
+    advertise_dmabuf: bool,
+) -> Result<(EventLoop<'static, State>, State, OsString)> {
+    let event_loop: EventLoop<'static, State> =
+        EventLoop::try_new().map_err(|e| Error::Socket(format!("calloop: {e}")))?;
+    let display: Display<State> =
+        Display::new().map_err(|e| Error::Socket(format!("wl_display: {e}")))?;
+    let dh = display.handle();
+
+    let compositor_state = CompositorState::new::<State>(&dh);
+    let xdg_shell_state = XdgShellState::new::<State>(&dh);
+    let xdg_decoration_state = XdgDecorationState::new::<State>(&dh);
+    let shm_state = ShmState::new::<State>(&dh, vec![]);
+    let data_device_state = DataDeviceState::new::<State>(&dh);
+    let primary_selection_state = PrimarySelectionState::new::<State>(&dh);
+    let mut dmabuf_state = DmabufState::new();
+
+    let dmabuf_global = match caps.adapter {
+        Some(adapter) if advertise_dmabuf => {
+            let formats = shareable_formats(adapter)?;
+            if formats.is_empty() {
+                None
+            } else {
+                Some(dmabuf_state.create_global::<State>(&dh, formats))
+            }
+        }
+        _ => None,
+    };
+
+    // One output, sized to the default tenant size. It exists because a
+    // client with no `wl_output` at all cannot work out its scale and some
+    // toolkits refuse to map; its geometry is not placement policy, because
+    // nothing is ever placed on it.
+    let output = Output::new(
+        "glasspane".to_string(),
+        PhysicalProperties {
+            size: (0, 0).into(),
+            subpixel: Subpixel::Unknown,
+            make: "glasspane".into(),
+            model: "headless".into(),
+        },
+    );
+    let mode = OutputMode {
+        size: (caps.default_size.0 as i32, caps.default_size.1 as i32).into(),
+        refresh: 60_000,
+    };
+    output.change_current_state(
+        Some(mode),
+        Some(Transform::Normal),
+        None,
+        Some((0, 0).into()),
+    );
+    output.set_preferred(mode);
+    output.create_global::<State>(&dh);
+
+    let mut seat_state = smithay::input::SeatState::<State>::new();
+    let xkb = match caps.xkb_layout.as_deref() {
+        Some(layout) => XkbConfig {
+            layout,
+            ..Default::default()
+        },
+        None => XkbConfig::default(),
+    };
+    let (seat, keyboard, pointer) = State::make_seat(&mut seat_state, &dh, &caps.seat_name, xkb)?;
+
+    let socket = match &caps.socket_name {
+        Some(name) => ListeningSocketSource::with_name(name),
+        None => ListeningSocketSource::new_auto(),
+    }
+    .map_err(|e| Error::Socket(format!("bind: {e}")))?;
+    let socket_name = socket.socket_name().to_os_string();
+
+    let handle = event_loop.handle();
+    handle
+        .insert_source(socket, move |stream, _, state: &mut State| {
+            // The pid is read here, once, from the socket's peer credentials:
+            // it is the only thing that ties a tenant back to the Child the
+            // caller holds.
+            let pid = peer_pid(&stream);
+            let data = Arc::new(ClientState {
+                pid,
+                ..Default::default()
+            });
+            if let Err(e) = state.dh.insert_client(stream, data) {
+                state.reject(None, format!("insert_client: {e}"));
+            }
+        })
+        .map_err(|e| Error::Socket(format!("insert socket source: {e}")))?;
+
+    handle
+        .insert_source(
+            Generic::new(display, Interest::READ, Mode::Level),
+            |_, display, state: &mut State| {
+                // SAFETY: the display is never dropped out of the source.
+                unsafe { display.get_mut().dispatch_clients(state)? };
+                // Every answer to a client request — a registry global, a
+                // `wl_display.sync` reply, an `xdg_surface.configure` — is a
+                // buffered write, and the next thing this loop does is block
+                // in poll. A client whose entire startup is roundtrips
+                // (Chromium is one) reaches its timeout with zero toplevels
+                // without this line.
+                state.flush();
+                Ok(PostAction::Continue)
+            },
+        )
+        .map_err(|e| Error::Socket(format!("insert display source: {e}")))?;
+
+    let state = State {
+        start: Instant::now(),
+        dh,
+        sink,
+        compositor_state,
+        xdg_shell_state,
+        xdg_decoration_state,
+        shm_state,
+        dmabuf_state,
+        dmabuf_global,
+        data_device_state,
+        primary_selection_state,
+        seat_state,
+        seat,
+        keyboard,
+        pointer,
+        output,
+        tenants: Vec::new(),
+        next_tenant: 0,
+        popups: Vec::new(),
+        next_popup: 0,
+        grab: None,
+        focus_before_grab: None,
+        events: Default::default(),
+        pending_callbacks: Vec::new(),
+        default_size: caps.default_size,
+        keyboard_focus: None,
+        pointer_focus: None,
+        ticks: 0,
+        callbacks_sent: 0,
+    };
+    Ok((event_loop, state, socket_name))
 }
 
 /// The client's pid, from `SO_PEERCRED`.
@@ -652,9 +688,7 @@ fn peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
 
 /// The DRM formats and modifiers this adapter can both import from and export
 /// to a dma-buf, in the shape `DmabufState::create_global` wants.
-fn shareable_formats(
-    adapter: &wgpu::Adapter,
-) -> Result<Vec<smithay::backend::allocator::Format>> {
+fn shareable_formats(adapter: &wgpu::Adapter) -> Result<Vec<smithay::backend::allocator::Format>> {
     use smithay::backend::allocator::Format;
     let mut out = Vec::new();
     for fourcc in texture::ACCEPTED_FOURCC {

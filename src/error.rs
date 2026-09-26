@@ -32,6 +32,9 @@ pub enum Error {
     Spawn(std::io::Error),
     /// The calloop dispatch itself failed.
     Dispatch(String),
+    /// The daemon socket failed, closed, or said something unexpected; or a
+    /// call that does not cross it yet was made on a remote facade.
+    Remote(String),
 }
 
 impl fmt::Display for Error {
@@ -45,6 +48,7 @@ impl fmt::Display for Error {
             Error::Rejected(s) => write!(f, "commit rejected: {s}"),
             Error::Spawn(e) => write!(f, "spawn: {e}"),
             Error::Dispatch(e) => write!(f, "dispatch: {e}"),
+            Error::Remote(e) => write!(f, "glasspane daemon: {e}"),
         }
     }
 }
