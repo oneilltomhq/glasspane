@@ -430,6 +430,18 @@ impl Glasspane {
     pub fn keyboard_key(&mut self, _to: Option<TenantId>, _evdev: u32, _s: KeyState) -> Result<()> {
         Err(Self::no_input())
     }
+    /// Not in the spike: always `None`.
+    pub fn keyboard_focus_at(&self) -> Option<Target> {
+        None
+    }
+    /// Not in the spike: always `None`.
+    pub fn pointer_focus_at(&self) -> Option<Target> {
+        None
+    }
+    /// Not in the spike: always an error.
+    pub fn keyboard_key_at(&mut self, _to: Option<Target>, _evdev: u32, _s: KeyState) -> Result<()> {
+        Err(Self::no_input())
+    }
 
     // --- internals ------------------------------------------------------------
 
