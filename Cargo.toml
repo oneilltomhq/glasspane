@@ -24,6 +24,22 @@ wgpu-dmabuf = { path = "../wgpu-dmabuf", version = "0.1" }
 drm-fourcc = "2"
 libc = "0.2"
 
+# Only the daemon binary needs it, to request an adapter (never a device).
+pollster = { version = "0.4", optional = true }
+
+[features]
+# `glasspane::daemon` and the `glasspane-daemon` binary: the compositor in its
+# own process with no wgpu device, exporting each commit's dma-buf over a unix
+# socket instead of importing it. A feature of this crate rather than a
+# workspace member because it is the same `State` in a different mode, and
+# `State` is `pub(crate)` on purpose.
+daemon = ["dep:pollster"]
+
+[[bin]]
+name = "glasspane-daemon"
+path = "src/bin/glasspane-daemon.rs"
+required-features = ["daemon"]
+
 [dependencies.smithay]
 version = "0.7"
 default-features = false
