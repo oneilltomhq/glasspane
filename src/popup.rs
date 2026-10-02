@@ -15,7 +15,7 @@
 //! # The position
 //!
 //! [`Popup::position`] is the popup's top-left corner **in its root tenant's
-//! buffer pixels**, not in its immediate parent's. A submenu's parent is
+//! logical pixels**, not in its immediate parent's. A submenu's parent is
 //! another popup, and a shell that drew it relative to that popup would have
 //! to walk the chain itself to find a quad to hang it off; the walk is done
 //! here instead, once, when the popup is created or repositioned. So
@@ -61,10 +61,10 @@ pub struct Popup {
     pub(crate) id: PopupId,
     pub(crate) parent: Parent,
     pub(crate) root: TenantId,
-    /// The popup's *window geometry* origin in root buffer pixels: what a
+    /// The popup's *window geometry* origin in root logical pixels: what a
     /// child popup's positioner is resolved against.
     pub(crate) anchor: (i32, i32),
-    /// The popup's *buffer* top-left in root buffer pixels, which is
+    /// The popup's *buffer* top-left in root logical pixels, which is
     /// [`Popup::anchor`] less whatever offset the client's own window
     /// geometry has. What the shell draws at.
     pub(crate) position: (i32, i32),
@@ -90,7 +90,7 @@ impl Popup {
         self.root
     }
 
-    /// The popup's top-left corner in [`Popup::root`]'s buffer pixels. See the
+    /// The popup's top-left corner in [`Popup::root`]'s logical pixels. See the
     /// module docs: this is resolved against the whole parent chain, so it is
     /// always relative to the tenant and never to an intermediate popup.
     ///
@@ -103,10 +103,18 @@ impl Popup {
         self.position
     }
 
-    /// The size of the last committed buffer, in pixels: the texture's size,
-    /// and the space input coordinates for this popup are in.
+    /// The popup's logical size: the space input coordinates for this popup
+    /// are in, and the size to draw it at beside its root tenant's
+    /// [`crate::Tenant::size`]. See that for how it differs from the buffer.
     pub fn size(&self) -> (u32, u32) {
         self.skin.size
+    }
+
+    /// The size of the last committed buffer in pixels, cropped to its
+    /// viewport's source if it sets one: the texture's size. `(0, 0)` before
+    /// the first commit.
+    pub fn buffer_size(&self) -> (u32, u32) {
+        self.skin.buffer
     }
 
     /// Whether this popup asked for — and was given — an explicit grab.

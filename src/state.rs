@@ -26,10 +26,15 @@ use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, DisplayHandle, Resource};
 use smithay::wayland::buffer::BufferHandler;
+use smithay::utils::Transform;
 use smithay::wayland::compositor::{
     BufferAssignment, CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes,
-    with_states,
+    send_surface_state, with_states,
 };
+use smithay::wayland::fractional_scale::{
+    FractionalScaleHandler, FractionalScaleManagerState, with_fractional_scale,
+};
+use smithay::wayland::viewporter::{ViewportCachedState, ViewporterState};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier, get_dmabuf};
 use smithay::wayland::selection::SelectionHandler;
 use smithay::wayland::selection::primary_selection::{
@@ -89,6 +94,92 @@ pub(crate) fn buffer_key(buffer: &WlBuffer) -> BufferKey {
     BufferKey(h.finish())
 }
 
+/// What a commit says about how its buffer maps onto the surface: the
+/// `wl_surface.set_buffer_scale`, the `wp_viewport` size (its destination,
+/// else its source's), and the viewport's source rectangle, if any.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Shape {
+    pub(crate) buffer_scale: i32,
+    pub(crate) viewport: Option<(u32, u32)>,
+    /// The `wp_viewport` source: `x, y, width, height` in surface-local
+    /// logical pixels, which is buffer pixels over `buffer_scale`.
+    pub(crate) source: Option<(f64, f64, f64, f64)>,
+}
+
+impl Shape {
+    /// The surface's logical size for a buffer of `buffer` pixels.
+    ///
+    /// A viewport destination wins, since it is exactly the client saying
+    /// "this buffer is this big": a fractionally scaled client draws 2.1x and
+    /// sets one. Otherwise the buffer is divided by its integer scale. A
+    /// viewport *source* is not this function's: the texture is already the
+    /// cropped rectangle ([`Shape::crop`]) when it is asked.
+    pub(crate) fn logical(self, buffer: (u32, u32)) -> (u32, u32) {
+        if let Some(size) = self.viewport {
+            return size;
+        }
+        let s = self.buffer_scale.max(1) as u32;
+        (buffer.0 / s, buffer.1 / s)
+    }
+
+    /// The rectangle of a `buffer`-pixel buffer that is the surface's picture:
+    /// `x, y, width, height` in buffer pixels. The viewport's source, scaled
+    /// to buffer pixels and kept inside the buffer, else the whole buffer.
+    ///
+    /// A client that sets one is drawing into part of a bigger buffer —
+    /// Chromium keeps its buffer when a window shrinks and crops it — and the
+    /// texture is only that part, so a shell drawing the texture whole draws
+    /// what the client meant. A source that misses the buffer is a protocol
+    /// error glasspane does not raise; it gets the whole buffer.
+    pub(crate) fn crop(self, buffer: (u32, u32)) -> (u32, u32, u32, u32) {
+        let whole = (0, 0, buffer.0, buffer.1);
+        let Some((x, y, w, h)) = self.source else {
+            return whole;
+        };
+        let s = f64::from(self.buffer_scale.max(1));
+        let (bw, bh) = (f64::from(buffer.0), f64::from(buffer.1));
+        let (x0, y0) = ((x * s).round().clamp(0.0, bw), (y * s).round().clamp(0.0, bh));
+        let (x1, y1) = (((x + w) * s).round().clamp(0.0, bw), ((y + h) * s).round().clamp(0.0, bh));
+        if x1 <= x0 || y1 <= y0 {
+            return whole;
+        }
+        (x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32)
+    }
+
+    fn of(states: &smithay::wayland::compositor::SurfaceData) -> Shape {
+        let buffer_scale = states
+            .cached_state
+            .get::<SurfaceAttributes>()
+            .current()
+            .buffer_scale;
+        let mut cached = states.cached_state.get::<ViewportCachedState>();
+        let port = cached.current();
+        let viewport = port
+            .size()
+            .filter(|s| s.w > 0 && s.h > 0)
+            .map(|s| (s.w as u32, s.h as u32));
+        let source = port
+            .src
+            .map(|r| (r.loc.x, r.loc.y, r.size.w, r.size.h));
+        Shape {
+            buffer_scale,
+            viewport,
+            source,
+        }
+    }
+}
+
+/// Ask one surface to draw at `scale`, through both protocols that can say
+/// it. Each only sends when the value moved, so asking twice is free.
+pub(crate) fn ask_scale(surface: &WlSurface, scale: f64) {
+    with_states(surface, |states| {
+        with_fractional_scale(states, |fs| fs.set_preferred_scale(scale));
+        // Up, not to nearest: an integer-only client asked for 1.5 that
+        // draws 2 is downsampled a little; one that draws 1 is blurred.
+        send_surface_state(surface, states, scale.ceil().max(1.0) as i32, Transform::Normal);
+    });
+}
+
 /// Everything the compositor owns. One struct, because calloop dispatches
 /// against exactly one.
 pub struct State {
@@ -98,6 +189,14 @@ pub struct State {
     pub(crate) queue: wgpu::Queue,
 
     pub(crate) compositor_state: CompositorState,
+    /// Held for as long as the display, like the decoration state: dropping
+    /// it withdraws `wp_fractional_scale_manager_v1`.
+    #[allow(dead_code)]
+    pub(crate) fractional_scale_state: FractionalScaleManagerState,
+    /// Held for as long as the display: dropping it withdraws `wp_viewporter`,
+    /// which is how a fractionally scaled client says its logical size.
+    #[allow(dead_code)]
+    pub(crate) viewporter_state: ViewporterState,
     pub(crate) xdg_shell_state: XdgShellState,
     /// Held for as long as the display: dropping the state would withdraw
     /// the `zxdg_decoration_manager_v1` global from under live clients.
@@ -324,45 +423,50 @@ impl State {
         }
     }
 
-    /// Make sure this tenant's texture is `width` x `height`, recreating it —
-    /// and saying so — if it is not.
-    fn ensure_texture(&mut self, slot: Slot, width: u32, height: u32) {
+    /// Make sure this surface's texture is `width` x `height` — its buffer,
+    /// cropped — and its logical size is what `shape` makes of that,
+    /// recreating the texture if it has to and saying so if either moved.
+    fn ensure_texture(&mut self, slot: Slot, width: u32, height: u32, shape: Shape) {
+        let size = shape.logical((width, height));
         let fits = self
             .skin(slot)
             .texture
             .as_ref()
             .is_some_and(|t| t.width() == width && t.height() == height);
-        if fits {
+        if fits && self.skin(slot).size == size {
             return;
         }
-        let label = match slot {
-            Slot::Tenant(i) => format!("tenant#{}", self.tenants[i].id.0),
-            Slot::Popup(i) => format!("popup#{}", self.popups[i].id.0),
-        };
-        let tex = texture::create_surface_texture(&self.device, &label, width, height);
+        if !fits {
+            let label = match slot {
+                Slot::Tenant(i) => format!("tenant#{}", self.tenants[i].id.0),
+                Slot::Popup(i) => format!("popup#{}", self.popups[i].id.0),
+            };
+            let tex = texture::create_surface_texture(&self.device, &label, width, height);
+            self.skin_mut(slot).texture = Some(Arc::new(tex));
+        }
         let skin = self.skin_mut(slot);
-        skin.texture = Some(Arc::new(tex));
-        skin.size = (width, height);
+        skin.size = size;
+        skin.buffer = (width, height);
         let event = match slot {
             Slot::Tenant(i) => Event::Resized {
                 id: self.tenants[i].id,
-                size: (width, height),
+                size,
             },
             Slot::Popup(i) => Event::PopupResized {
                 id: self.popups[i].id,
-                size: (width, height),
+                size,
             },
         };
         self.emit(event);
     }
 
     /// One committed buffer becomes texels.
-    fn absorb_buffer(&mut self, slot: Slot, buffer: &WlBuffer) {
+    fn absorb_buffer(&mut self, slot: Slot, buffer: &WlBuffer, shape: Shape) {
         let key = buffer_key(buffer);
 
         let result = match get_dmabuf(buffer) {
-            Ok(dmabuf) => self.absorb_dmabuf(slot, key, &dmabuf.clone()),
-            Err(_) => self.absorb_shm(slot, buffer),
+            Ok(dmabuf) => self.absorb_dmabuf(slot, key, &dmabuf.clone(), shape),
+            Err(_) => self.absorb_shm(slot, buffer, shape),
         };
 
         match result {
@@ -398,6 +502,7 @@ impl State {
         slot: Slot,
         key: BufferKey,
         dmabuf: &Dmabuf,
+        shape: Shape,
     ) -> Result<(), String> {
         use smithay::backend::allocator::Buffer as _;
 
@@ -425,17 +530,18 @@ impl State {
             })
             .map_err(|e| format!("dmabuf import failed: {e}"))?;
 
-        self.ensure_texture(slot, width, height);
+        let crop = shape.crop((width, height));
+        self.ensure_texture(slot, crop.2, crop.3, shape);
         let dst = self
             .skin(slot)
             .texture
             .clone()
             .expect("ensure_texture just set it");
-        texture::blit(&self.device, &self.queue, &src, &dst, width, height);
+        texture::blit(&self.device, &self.queue, &src, &dst, crop);
         Ok(())
     }
 
-    fn absorb_shm(&mut self, slot: Slot, buffer: &WlBuffer) -> Result<(), String> {
+    fn absorb_shm(&mut self, slot: Slot, buffer: &WlBuffer, shape: Shape) -> Result<(), String> {
         let read = with_buffer_contents(buffer, |ptr, len, data| {
             match data.format {
                 wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888 => {}
@@ -467,13 +573,14 @@ impl State {
             Err(e) => return Err(format!("buffer is neither dma-buf nor wl_shm: {e}")),
         };
         self.skin_mut(slot).acquire_staged = false;
-        self.ensure_texture(slot, w, h);
+        let crop = shape.crop((w, h));
+        self.ensure_texture(slot, crop.2, crop.3, shape);
         let dst = self
             .skin(slot)
             .texture
             .clone()
             .expect("ensure_texture just set it");
-        texture::upload_shm(&self.queue, &dst, &bytes, stride, w, h);
+        texture::upload_shm(&self.queue, &dst, &bytes, stride, crop);
         Ok(())
     }
 }
@@ -725,7 +832,7 @@ impl CompositorHandler for State {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
-        let (buffer, callbacks) = with_states(surface, |states| {
+        let (buffer, callbacks, shape) = with_states(surface, |states| {
             let mut guard = states.cached_state.get::<SurfaceAttributes>();
             let attrs = guard.current();
             let buffer = match &attrs.buffer {
@@ -733,7 +840,8 @@ impl CompositorHandler for State {
                 _ => None,
             };
             let callbacks = std::mem::take(&mut attrs.frame_callbacks);
-            (buffer, callbacks)
+            drop(guard);
+            (buffer, callbacks, Shape::of(states))
         });
 
         match self.slot_of_surface(surface) {
@@ -747,7 +855,7 @@ impl CompositorHandler for State {
                     toplevel.send_configure();
                 }
                 if let Some(buffer) = buffer {
-                    self.absorb_buffer(Slot::Tenant(index), &buffer);
+                    self.absorb_buffer(Slot::Tenant(index), &buffer, shape);
                 }
             }
             Some(Slot::Popup(index)) => {
@@ -764,7 +872,7 @@ impl CompositorHandler for State {
                 // and move the popup if it moved.
                 self.refresh_popup_position(index);
                 if let Some(buffer) = buffer {
-                    self.absorb_buffer(Slot::Popup(index), &buffer);
+                    self.absorb_buffer(Slot::Popup(index), &buffer, shape);
                 }
             }
             None => {}
@@ -839,6 +947,7 @@ impl XdgShellHandler for State {
         let size = self.default_size;
         toplevel.with_pending_state(|state| {
             state.size = Some((size.0 as i32, size.1 as i32).into());
+            tile(state);
         });
         toplevel.send_configure();
         self.tenants.push(Tenant {
@@ -847,6 +956,7 @@ impl XdgShellHandler for State {
             title: None,
             app_id: None,
             configured: Some(size),
+            scale: 1.0,
             skin: Skin {
                 size,
                 ..Default::default()
@@ -922,6 +1032,13 @@ impl XdgShellHandler for State {
         // Same as a toplevel: the client is told which output it is on before
         // it is asked to paint.
         self.output.enter(&wl_surface);
+        // And at the scale its tenant was asked for, before it paints its
+        // first buffer: a menu drawn at 1 over a pane drawn at 2 is the one
+        // blurry thing on screen.
+        let scale = self.index_of(root).map_or(1.0, |i| self.tenants[i].scale);
+        if scale != 1.0 {
+            ask_scale(&wl_surface, scale);
+        }
         self.popups.push(Popup {
             id,
             parent,
@@ -1051,6 +1168,21 @@ impl XdgDecorationHandler for State {
     }
 }
 
+/// Mark a toplevel tiled on all four edges.
+///
+/// A configured size is otherwise only an upper bound: an `xdg_toplevel` that
+/// believes it is floating may pick something smaller, and foot does — it
+/// rounds down to whole cells, and on a scale change it keeps its grid of
+/// cells and resizes itself around the new font. Every tenant here is a pane
+/// whose size the shell decides, which is what "tiled" says, and a client
+/// told so takes the size it is given.
+pub(crate) fn tile(state: &mut smithay::wayland::shell::xdg::ToplevelState) {
+    use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State as S;
+    for edge in [S::TiledLeft, S::TiledRight, S::TiledTop, S::TiledBottom] {
+        state.states.set(edge);
+    }
+}
+
 fn announce_server_side(toplevel: &ToplevelSurface) {
     toplevel.with_pending_state(|state| {
         state.decoration_mode = Some(DecorationMode::ServerSide);
@@ -1110,7 +1242,11 @@ impl ServerDndGrabHandler for State {}
 
 impl smithay::wayland::output::OutputHandler for State {}
 
+impl FractionalScaleHandler for State {}
+
 smithay::delegate_compositor!(State);
+smithay::delegate_fractional_scale!(State);
+smithay::delegate_viewporter!(State);
 smithay::delegate_shm!(State);
 smithay::delegate_dmabuf!(State);
 smithay::delegate_xdg_shell!(State);
@@ -1142,6 +1278,49 @@ impl State {
 
 #[cfg(test)]
 mod tests {
+    /// Chromium shrunk to 1434x551 keeps its 1920x1200 buffer and crops it:
+    /// the texture is the cropped corner, not the whole buffer squeezed.
+    #[test]
+    fn a_viewport_source_is_the_part_of_the_buffer_drawn() {
+        let cropped = super::Shape {
+            buffer_scale: 1,
+            viewport: Some((1434, 551)),
+            source: Some((0.0, 0.0, 1434.0, 551.0)),
+        };
+        assert_eq!(cropped.crop((1920, 1200)), (0, 0, 1434, 551));
+        assert_eq!(cropped.logical((1434, 551)), (1434, 551));
+        // In logical pixels: at buffer scale 2 it is twice as many texels.
+        let scaled = super::Shape { buffer_scale: 2, source: Some((10.0, 5.0, 100.0, 50.0)), ..cropped };
+        assert_eq!(scaled.crop((1920, 1200)), (20, 10, 200, 100));
+        // Kept inside the buffer; a source wholly off it is no crop.
+        let over = super::Shape { source: Some((1800.0, 0.0, 400.0, 100.0)), ..cropped };
+        assert_eq!(over.crop((1920, 1200)), (1800, 0, 120, 100));
+        let off = super::Shape { source: Some((2000.0, 0.0, 10.0, 10.0)), ..cropped };
+        assert_eq!(off.crop((1920, 1200)), (0, 0, 1920, 1200));
+        let none = super::Shape { source: None, ..cropped };
+        assert_eq!(none.crop((1920, 1200)), (0, 0, 1920, 1200));
+    }
+
+    #[test]
+    fn a_viewport_destination_is_the_logical_size() {
+        let shape = super::Shape { buffer_scale: 1, viewport: Some((390, 520)), source: None };
+        assert_eq!(shape.logical((819, 1092)), (390, 520));
+    }
+
+    #[test]
+    fn without_a_viewport_the_buffer_is_divided_by_its_scale() {
+        let shape = super::Shape { buffer_scale: 2, viewport: None, source: None };
+        assert_eq!(shape.logical((780, 1040)), (390, 520));
+        let shape = super::Shape { buffer_scale: 1, viewport: None, source: None };
+        assert_eq!(shape.logical((390, 520)), (390, 520));
+    }
+
+    #[test]
+    fn a_nonsense_buffer_scale_is_read_as_one() {
+        let shape = super::Shape { buffer_scale: 0, viewport: None, source: None };
+        assert_eq!(shape.logical((390, 520)), (390, 520));
+    }
+
     use super::place_in;
     use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_positioner::{
         Anchor, ConstraintAdjustment, Gravity,
