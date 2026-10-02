@@ -589,3 +589,88 @@ fn a_clipboard_selection_crosses_between_tenants() {
         assert_eq!(got, "hello clipboard");
     }
 }
+
+/// `foot` on `PATH`, or `None`, saying so.
+fn foot() -> Option<std::path::PathBuf> {
+    let found = std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|d| d.join("foot"))
+            .find(|p| p.is_file())
+    });
+    if found.is_none() {
+        eprintln!("SKIP: foot is not installed");
+    }
+    found
+}
+
+/// **A tenant asked to draw at 2 paints twice the pixels at the same size.**
+///
+/// Against a real client that speaks `wp_fractional_scale_v1` and
+/// `wp_viewporter`, because the claim is about what a client does with the
+/// ask: the texture doubles in each direction, and the logical size — the
+/// space input and popups are in — does not move. Then a fractional scale,
+/// which only the fractional protocol can carry, and back to 1.
+#[test]
+fn a_scaled_tenant_paints_more_pixels_at_the_same_size() {
+    let Some(foot) = foot() else {
+        return;
+    };
+    let Some((adapter, device, queue)) = gpu() else {
+        return;
+    };
+    let mut pane = start("scale", Some(&adapter), device, queue);
+    let mut events = Vec::new();
+    let mut cmd = std::process::Command::new(foot);
+    // No user config: a font size or a `dpi-aware` from the machine running
+    // the test is not what is under test. Its default `resize-by-cells=yes`
+    // is kept on purpose: a floating foot snaps 520 to whole cells, and on a
+    // scale change keeps its grid and resizes around the new font. A tiled
+    // one takes the size it is given, and every tenant here is tiled.
+    cmd.args(["--config", "/dev/null"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = pane.spawn(cmd).expect("spawn foot");
+    let id = map_and_focus(&mut pane, &mut events, "foot");
+    pane.configure(id, (390, 520)).unwrap();
+
+    let settle = |pane: &mut Glasspane, events: &mut Vec<Event>, buffer: (u32, u32)| {
+        let ok = pump(pane, events, Duration::from_secs(10), |pane, _| {
+            pane.tenant(id)
+                .is_some_and(|t| t.size() == (390, 520) && t.buffer_size() == buffer)
+        });
+        let t = pane.tenant(id).unwrap();
+        assert!(
+            ok,
+            "wanted 390x520 over a {buffer:?} buffer, got {:?} over {:?}",
+            t.size(),
+            t.buffer_size()
+        );
+        let tex = t.texture().unwrap();
+        assert_eq!((tex.width(), tex.height()), buffer, "the texture is the buffer");
+    };
+
+    settle(&mut pane, &mut events, (390, 520));
+    pane.set_scale(id, 2.0).unwrap();
+    assert_eq!(pane.tenant(id).unwrap().scale(), 2.0);
+    settle(&mut pane, &mut events, (780, 1040));
+    let from = events.len();
+    pane.set_scale(id, 3.0).unwrap();
+    settle(&mut pane, &mut events, (1170, 1560));
+    assert!(
+        events[from..]
+            .iter()
+            .any(|e| matches!(e, Event::Resized { id: r, size: (390, 520) } if *r == id)),
+        "the new buffer, at the same size, was not announced: {events:?}"
+    );
+    pane.set_scale(id, 2.1).unwrap();
+    settle(&mut pane, &mut events, (819, 1092));
+    pane.set_scale(id, 1.0).unwrap();
+    settle(&mut pane, &mut events, (390, 520));
+
+    assert!(matches!(
+        pane.set_scale(id, 0.0),
+        Err(glasspane::Error::BadScale(_))
+    ));
+    let _ = child.kill();
+    let _ = child.wait();
+}

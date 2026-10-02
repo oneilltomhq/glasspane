@@ -57,13 +57,18 @@ pub enum Event {
         /// [`crate::Tenant::generation`] as of this commit.
         generation: u64,
     },
-    /// The tenant's buffer size changed, so its texture was recreated. Any
-    /// bind group, view or copy descriptor the caller derived from the old
-    /// handle is stale as of this event and *only* as of this event.
+    /// The tenant's size changed: its logical size, its buffer's
+    /// ([`crate::Tenant::buffer_size`]), or both.
+    ///
+    /// When the buffer's changed the texture was recreated, and any bind
+    /// group, view or copy descriptor the caller derived from the old handle
+    /// is stale as of this event and *only* as of this event. A tenant
+    /// repainting at a new scale fires this with the same `size`.
     Resized {
         /// The tenant.
         id: TenantId,
-        /// The new size in buffer pixels.
+        /// The new logical size: the space input and popups are in. See
+        /// [`crate::Tenant::size`].
         size: (u32, u32),
     },
     /// An `xdg_popup` became a popup over one of this compositor's tenants.
@@ -78,10 +83,10 @@ pub enum Event {
         parent: Parent,
         /// The tenant at the top of the chain — the pane it belongs over.
         root: TenantId,
-        /// Its top-left corner in `root`'s buffer pixels. See
+        /// Its top-left corner in `root`'s logical pixels. See
         /// [`crate::Popup::position`].
         position: (i32, i32),
-        /// The size its positioner asked for, in pixels. The size that
+        /// The size its positioner asked for, in logical pixels. The size that
         /// arrives with the first commit is the one to believe.
         size: (u32, u32),
     },
@@ -97,7 +102,7 @@ pub enum Event {
     PopupMoved {
         /// The popup.
         id: PopupId,
-        /// Its new top-left in its root tenant's buffer pixels.
+        /// Its new top-left in its root tenant's logical pixels.
         position: (i32, i32),
         /// The size its new positioner asks for.
         size: (u32, u32),
@@ -110,12 +115,13 @@ pub enum Event {
         /// [`crate::Popup::generation`] as of this commit.
         generation: u64,
     },
-    /// The popup's buffer size changed, so its texture was recreated. The
-    /// popup analogue of [`Event::Resized`], with the same staleness rule.
+    /// The popup's size changed. The popup analogue of [`Event::Resized`],
+    /// with the same staleness rule.
     PopupResized {
         /// The popup.
         id: PopupId,
-        /// The new size in buffer pixels.
+        /// The new logical size. The buffer's is
+        /// [`crate::Popup::buffer_size`].
         size: (u32, u32),
     },
     /// The popup is gone: dismissed, destroyed by its client, or taken down

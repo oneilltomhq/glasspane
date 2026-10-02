@@ -39,6 +39,9 @@ pub struct Tenant {
     pub(crate) title: Option<String>,
     pub(crate) app_id: Option<String>,
     pub(crate) configured: Option<(u32, u32)>,
+    /// The scale last asked of this tenant through
+    /// [`crate::Glasspane::set_scale`]; its popups are asked the same.
+    pub(crate) scale: f64,
     pub(crate) skin: Skin,
     pub(crate) surface: WlSurface,
     pub(crate) toplevel: ToplevelSurface,
@@ -65,13 +68,33 @@ impl Tenant {
         self.app_id.as_deref()
     }
 
-    /// The size of the last committed buffer, in pixels. This is the texture's
-    /// size, and it is what input coordinates are expressed in.
+    /// The tenant's logical size: the size it was configured in, the space
+    /// input coordinates are expressed in, and the space its popups are
+    /// positioned in.
+    ///
+    /// For a client drawing at scale 1 this is also its buffer's size. For one
+    /// drawing at a higher scale (see [`crate::Glasspane::set_scale`]) the
+    /// buffer, and so the texture, is larger: [`Tenant::buffer_size`]. A shell
+    /// places and hit-tests by this one and samples the texture by UV, and
+    /// never needs the other.
     ///
     /// Before the first commit this is the size this tenant was configured
     /// with, which the client may not have honoured yet.
     pub fn size(&self) -> (u32, u32) {
         self.skin.size
+    }
+
+    /// The size of the last committed buffer in pixels, which is the
+    /// texture's size. `(0, 0)` before the first commit.
+    pub fn buffer_size(&self) -> (u32, u32) {
+        self.skin.buffer
+    }
+
+    /// The scale this tenant was last asked to draw at, `1.0` until
+    /// [`crate::Glasspane::set_scale`] says otherwise. What the client
+    /// actually drew at is [`Tenant::buffer_size`] over [`Tenant::size`].
+    pub fn scale(&self) -> f64 {
+        self.scale
     }
 
     /// The size this tenant was last told to be, via
@@ -85,7 +108,7 @@ impl Tenant {
     /// The texture holding this tenant's pixels, or `None` before its first
     /// commit.
     ///
-    /// **The handle is stable while [`Tenant::size`] is unchanged.** Every
+    /// **The handle is stable while [`Tenant::buffer_size`] is unchanged.** Every
     /// commit lands in the same texture; the handle changes only across an
     /// [`crate::Event::Resized`]. Index it, do not rebind per frame.
     pub fn texture(&self) -> Option<&wgpu::Texture> {

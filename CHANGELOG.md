@@ -26,6 +26,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Primary selection: the `zwp_primary_selection_device_manager_v1` global,
   offered to whichever tenant has the keyboard, as the clipboard already was.
   Select in one tenant and middle-click in another and the text crosses.
+- `Glasspane::set_scale`: ask a tenant, and its popups, to draw at a scale,
+  for a shell that draws it larger than its logical size. Sent as
+  `wp_fractional_scale_v1.preferred_scale` and, rounded up, as
+  `wl_surface.preferred_buffer_scale`; the `wp_fractional_scale_manager_v1`
+  and `wp_viewporter` globals are offered and `wl_compositor` is version 6
+  for it. `Error::BadScale` for a scale that is not a number above zero.
+- `Tenant::buffer_size`, `Tenant::scale` and `Popup::buffer_size`.
 
 ### Changed
 
@@ -37,6 +44,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Every toplevel is configured tiled on all four edges, so it takes the size
   it is given. A floating foot rounded its size down to whole cells, and on a
   scale change kept its grid and resized itself around the new font.
+- `Tenant::size`, `Popup::size`, popup positions and every input coordinate
+  are **logical** pixels: the configured size, and what `wl_pointer` speaks.
+  At scale 1 nothing moves. Above it the texture is larger than the size, by
+  the scale; sample it by UV and hit-test by `size`.
+- `Event::Resized` and `Event::PopupResized` fire when the logical size or
+  the buffer's moves, so a repaint at a new scale is announced with the same
+  `size`. Their fields are unchanged.
 
 ## [0.1.0] - 2026-09-14
 

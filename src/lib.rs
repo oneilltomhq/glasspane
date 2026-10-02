@@ -36,13 +36,15 @@
 //!
 //! **The texture handle is stable while the size is.** Each tenant owns one
 //! texture; commits are copied into it. It is replaced only when the client's
-//! buffer size changes, which is announced as [`Event::Resized`] before any
+//! buffer size changes (a new size, or a new scale), which is announced as [`Event::Resized`] before any
 //! [`Event::Committed`] against the new handle. Index tenants by [`TenantId`],
 //! sample their textures, and never rebind per frame.
 //!
 //! # Coordinates
 //!
-//! Input is in tenant-local buffer pixels, origin top-left. See [`input`].
+//! Input is in tenant-local logical pixels, origin top-left. See [`input`].
+//! A tenant asked to draw at a scale above 1 ([`Glasspane::set_scale`]) has a
+//! texture larger than its logical size; the coordinates do not change.
 //!
 //! # A whole session
 //!
@@ -121,6 +123,8 @@ use smithay::reexports::calloop::{EventLoop, Interest, Mode, PostAction, generic
 use smithay::reexports::wayland_server::Display;
 use smithay::utils::Transform;
 use smithay::wayland::compositor::CompositorState;
+use smithay::wayland::fractional_scale::FractionalScaleManagerState;
+use smithay::wayland::viewporter::ViewporterState;
 use smithay::wayland::dmabuf::DmabufState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::selection::primary_selection::PrimarySelectionState;
@@ -255,7 +259,11 @@ impl Glasspane {
             Display::new().map_err(|e| Error::Socket(format!("wl_display: {e}")))?;
         let dh = display.handle();
 
-        let compositor_state = CompositorState::new::<State>(&dh);
+        // Version 6, for `wl_surface.preferred_buffer_scale`: the integer
+        // scale a client without the fractional protocol draws at.
+        let compositor_state = CompositorState::new_v6::<State>(&dh);
+        let fractional_scale_state = FractionalScaleManagerState::new::<State>(&dh);
+        let viewporter_state = ViewporterState::new::<State>(&dh);
         let xdg_shell_state = XdgShellState::new::<State>(&dh);
         let xdg_decoration_state = XdgDecorationState::new::<State>(&dh);
         let shm_state = ShmState::new::<State>(&dh, vec![]);
@@ -373,6 +381,8 @@ impl Glasspane {
             device,
             queue,
             compositor_state,
+            fractional_scale_state,
+            viewporter_state,
             xdg_shell_state,
             xdg_decoration_state,
             shm_state,
@@ -495,7 +505,7 @@ impl Glasspane {
     /// Popups are **not** tenants and never appear in
     /// [`Glasspane::tenants`]: a shell that keeps a row of panes must not find
     /// a `<select>` menu in it. Each one carries the tenant it belongs over
-    /// and where, in that tenant's buffer pixels — see [`Popup`].
+    /// and where, in that tenant's logical pixels — see [`Popup`].
     pub fn popups(&self) -> impl ExactSizeIterator<Item = &Popup> {
         self.state.popups.iter()
     }
@@ -556,6 +566,48 @@ impl Glasspane {
         });
         toplevel.send_pending_configure();
         self.state.tenants[index].configured = Some(size);
+        self.state.flush();
+        Ok(())
+    }
+
+    /// Ask a tenant to draw at `scale` buffer pixels per logical pixel.
+    ///
+    /// For a shell that draws a tenant larger than its logical size: asked
+    /// at the scale it is drawn at, the client renders that many pixels and
+    /// the texture is sampled one texel per screen pixel instead of being
+    /// stretched. The logical size, input coordinates and popup positions do
+    /// not change; the texture does, announced as [`Event::Resized`] with a
+    /// larger `buffer`.
+    ///
+    /// Sent two ways, because clients listen for one or the other:
+    /// `wp_fractional_scale_v1.preferred_scale` (the exact scale, in 120ths;
+    /// the client draws a buffer of that size and says its logical size
+    /// through `wp_viewporter`), and `wl_surface.preferred_buffer_scale` (the
+    /// scale rounded *up* to an integer, for a client with only that — a
+    /// sharper buffer than asked beats a blurrier one). The tenant's popups,
+    /// open now or opened later, are asked the same.
+    ///
+    /// Like [`Glasspane::configure`] this is a request: the client repaints
+    /// when it next paints, and a client that speaks neither protocol keeps
+    /// drawing at 1. Asking for the scale already asked is free; nothing is
+    /// sent.
+    pub fn set_scale(&mut self, id: TenantId, scale: f64) -> Result<()> {
+        if !(scale.is_finite() && scale > 0.0) {
+            return Err(Error::BadScale(scale));
+        }
+        let index = self.state.index_of(id).ok_or(Error::NoSuchTenant(id))?;
+        self.state.tenants[index].scale = scale;
+        let mut surfaces = vec![self.state.tenants[index].surface.clone()];
+        surfaces.extend(
+            self.state
+                .popups
+                .iter()
+                .filter(|p| p.root == id)
+                .map(|p| p.surface.clone()),
+        );
+        for surface in &surfaces {
+            state::ask_scale(surface, scale);
+        }
         self.state.flush();
         Ok(())
     }

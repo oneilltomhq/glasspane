@@ -150,16 +150,23 @@ pub(crate) fn blit(
     queue.submit([encoder.finish()]);
 }
 
-/// The four fields every surface this crate hands to the shell has: its size,
-/// its texture, how many commits have landed in it, and whether the last one
-/// was fenced.
+/// The fields every surface this crate hands to the shell has: its size, its
+/// buffer's size, its texture, how many commits have landed in it, and
+/// whether the last one was fenced.
 ///
 /// A toplevel and a popup differ in what they *are* — one is a window, the
 /// other a rectangle floating over one — and not at all in how their pixels
 /// get here, so the commit path is written once against this and both wear it.
 #[derive(Debug, Default)]
 pub(crate) struct Skin {
+    /// The surface's logical size: what it was configured to, what input is
+    /// in, and what a popup is positioned in. Equal to [`Skin::buffer`] for a
+    /// client drawing at scale 1.
     pub(crate) size: (u32, u32),
+    /// The last committed buffer's size in pixels, which is the texture's.
+    /// Larger than [`Skin::size`] when the client draws at a scale above 1;
+    /// `(0, 0)` before the first commit.
+    pub(crate) buffer: (u32, u32),
     pub(crate) texture: Option<std::sync::Arc<wgpu::Texture>>,
     pub(crate) generation: u64,
     pub(crate) acquire_staged: bool,

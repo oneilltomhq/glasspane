@@ -32,6 +32,9 @@ pub enum Error {
     Spawn(std::io::Error),
     /// The calloop dispatch itself failed.
     Dispatch(String),
+    /// A scale that is not a finite number above zero. See
+    /// [`crate::Glasspane::set_scale`].
+    BadScale(f64),
 }
 
 impl fmt::Display for Error {
@@ -45,6 +48,7 @@ impl fmt::Display for Error {
             Error::Rejected(s) => write!(f, "commit rejected: {s}"),
             Error::Spawn(e) => write!(f, "spawn: {e}"),
             Error::Dispatch(e) => write!(f, "dispatch: {e}"),
+            Error::BadScale(s) => write!(f, "scale {s} is not a finite number above zero"),
         }
     }
 }

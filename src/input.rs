@@ -2,10 +2,15 @@
 //!
 //! # The coordinate contract
 //!
-//! Every pointer coordinate this crate accepts is **tenant-local, in buffer
-//! pixels, origin top-left**: the same space as [`crate::Tenant::size`], and the same
-//! space the client's own buffer is in. `(0.0, 0.0)` is the tenant's top-left
-//! texel and `(w, h)` is one past its bottom-right.
+//! Every pointer coordinate this crate accepts is **tenant-local, in logical
+//! pixels, origin top-left**: the same space as [`crate::Tenant::size`], and
+//! the space `wl_pointer` speaks to the client in. `(0.0, 0.0)` is the
+//! tenant's top-left corner and `(w, h)` is one past its bottom-right.
+//!
+//! Logical, not buffer: a tenant drawing at scale 2 has a texture twice its
+//! size in each direction, and the coordinate for the same spot is the same
+//! number at either scale. The scale is a question of how sharp the pixels
+//! are, never of where anything is.
 //!
 //! That is the whole contract, and it is deliberately the *only* one. glasspane
 //! has no idea where a tenant is on screen, how large it is drawn, whether it
@@ -40,7 +45,7 @@ use crate::{Error, Glasspane, Result};
 
 /// What an input event is aimed at: a tenant, or one of its popups.
 ///
-/// The coordinate contract is the same for both — buffer pixels, origin
+/// The coordinate contract is the same for both — logical pixels, origin
 /// top-left, in the space of the texture the shell sampled. A shell that
 /// hit-tests a popup quad hands back the pixel on *that* texture, not on the
 /// parent's.
@@ -151,7 +156,7 @@ impl Glasspane {
     }
 
     /// Move the pointer within a tenant or a popup, in that surface's own
-    /// buffer pixels.
+    /// logical pixels.
     pub fn pointer_motion_at(&mut self, target: Target, x: f64, y: f64) -> Result<()> {
         let slot = self
             .state
