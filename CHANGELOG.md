@@ -34,6 +34,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   keyboard. A browser only offers a menu to a window it believes is active.
 - Every surface is sent `wl_surface.enter` for the one output when it is
   mapped, toplevel or popup. A client with no `enter` has to guess its scale.
+- Every toplevel is configured tiled on all four edges, so it takes the size
+  it is given. A floating foot rounded its size down to whole cells, and on a
+  scale change kept its grid and resized itself around the new font.
 
 ## [0.1.0] - 2026-09-14
 

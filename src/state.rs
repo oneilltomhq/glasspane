@@ -839,6 +839,7 @@ impl XdgShellHandler for State {
         let size = self.default_size;
         toplevel.with_pending_state(|state| {
             state.size = Some((size.0 as i32, size.1 as i32).into());
+            tile(state);
         });
         toplevel.send_configure();
         self.tenants.push(Tenant {
@@ -1048,6 +1049,21 @@ impl XdgDecorationHandler for State {
 
     fn unset_mode(&mut self, toplevel: ToplevelSurface) {
         announce_server_side(&toplevel);
+    }
+}
+
+/// Mark a toplevel tiled on all four edges.
+///
+/// A configured size is otherwise only an upper bound: an `xdg_toplevel` that
+/// believes it is floating may pick something smaller, and foot does — it
+/// rounds down to whole cells, and on a scale change it keeps its grid of
+/// cells and resizes itself around the new font. Every tenant here is a pane
+/// whose size the shell decides, which is what "tiled" says, and a client
+/// told so takes the size it is given.
+pub(crate) fn tile(state: &mut smithay::wayland::shell::xdg::ToplevelState) {
+    use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State as S;
+    for edge in [S::TiledLeft, S::TiledRight, S::TiledTop, S::TiledBottom] {
+        state.states.set(edge);
     }
 }
 
