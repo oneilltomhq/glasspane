@@ -77,9 +77,11 @@ pub(crate) fn create_surface_texture(
     })
 }
 
-/// Upload an `wl_shm` pool's bytes into a tenant texture.
+/// Upload an `wl_shm` pool's bytes into a tenant texture: the `crop`
+/// rectangle of them (`x, y, width, height`, see `Shape::crop`), which is
+/// the whole buffer unless a viewport says otherwise.
 ///
-/// The whole buffer, every commit. glasspane does not yet track damage: a
+/// The whole picture, every commit. glasspane does not yet track damage: a
 /// partial upload that is wrong by one rectangle produces a tenant that looks
 /// right and is stale in a corner, and that failure is not worth having until
 /// there is a measurement saying the full upload costs something.
@@ -88,9 +90,9 @@ pub(crate) fn upload_shm(
     texture: &wgpu::Texture,
     bytes: &[u8],
     stride: u32,
-    width: u32,
-    height: u32,
+    crop: (u32, u32, u32, u32),
 ) {
+    let (x, y, width, height) = crop;
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
             texture,
@@ -100,7 +102,8 @@ pub(crate) fn upload_shm(
         },
         bytes,
         wgpu::TexelCopyBufferLayout {
-            offset: 0,
+            // Four bytes a pixel: both formats `absorb_shm` takes.
+            offset: u64::from(y) * u64::from(stride) + u64::from(x) * 4,
             bytes_per_row: Some(stride),
             rows_per_image: Some(height),
         },
@@ -112,7 +115,8 @@ pub(crate) fn upload_shm(
     );
 }
 
-/// Copy an imported client image into the tenant texture.
+/// Copy the `crop` rectangle of an imported client image (`x, y, width,
+/// height`, see `Shape::crop`) into the tenant texture, at its origin.
 ///
 /// The submit this issues is the one that carries the acquire wait staged by
 /// [`crate::acquire`], which is why the wait is staged at the top of the
@@ -122,9 +126,9 @@ pub(crate) fn blit(
     queue: &wgpu::Queue,
     src: &wgpu::Texture,
     dst: &wgpu::Texture,
-    width: u32,
-    height: u32,
+    crop: (u32, u32, u32, u32),
 ) {
+    let (x, y, width, height) = crop;
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("glasspane tenant blit"),
     });
@@ -132,7 +136,7 @@ pub(crate) fn blit(
         wgpu::TexelCopyTextureInfo {
             texture: src,
             mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
+            origin: wgpu::Origin3d { x, y, z: 0 },
             aspect: wgpu::TextureAspect::All,
         },
         wgpu::TexelCopyTextureInfo {
@@ -163,7 +167,8 @@ pub(crate) struct Skin {
     /// in, and what a popup is positioned in. Equal to [`Skin::buffer`] for a
     /// client drawing at scale 1.
     pub(crate) size: (u32, u32),
-    /// The last committed buffer's size in pixels, which is the texture's.
+    /// The last committed buffer's size in pixels, cropped to its viewport's
+    /// source if it sets one: the texture's.
     /// Larger than [`Skin::size`] when the client draws at a scale above 1;
     /// `(0, 0)` before the first commit.
     pub(crate) buffer: (u32, u32),

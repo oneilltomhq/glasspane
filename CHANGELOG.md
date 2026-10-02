@@ -33,6 +33,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and `wp_viewporter` globals are offered and `wl_compositor` is version 6
   for it. `Error::BadScale` for a scale that is not a number above zero.
 - `Tenant::buffer_size`, `Tenant::scale` and `Popup::buffer_size`.
+- A `wp_viewport` source rectangle is honoured: the texture is that part of
+  the buffer. Chromium, offered `wp_viewporter`, keeps a bigger buffer when a
+  window shrinks and crops it, and without this was drawn whole and squeezed.
 
 ### Changed
 

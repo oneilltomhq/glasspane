@@ -95,11 +95,15 @@ pub(crate) fn buffer_key(buffer: &WlBuffer) -> BufferKey {
 }
 
 /// What a commit says about how its buffer maps onto the surface: the
-/// `wl_surface.set_buffer_scale` and the `wp_viewport` destination, if any.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `wl_surface.set_buffer_scale`, the `wp_viewport` size (its destination,
+/// else its source's), and the viewport's source rectangle, if any.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Shape {
     pub(crate) buffer_scale: i32,
     pub(crate) viewport: Option<(u32, u32)>,
+    /// The `wp_viewport` source: `x, y, width, height` in surface-local
+    /// logical pixels, which is buffer pixels over `buffer_scale`.
+    pub(crate) source: Option<(f64, f64, f64, f64)>,
 }
 
 impl Shape {
@@ -108,8 +112,8 @@ impl Shape {
     /// A viewport destination wins, since it is exactly the client saying
     /// "this buffer is this big": a fractionally scaled client draws 2.1x and
     /// sets one. Otherwise the buffer is divided by its integer scale. A
-    /// viewport *source* crop is not applied — the whole buffer is the
-    /// texture — so a client that crops is drawn uncropped at the right size.
+    /// viewport *source* is not this function's: the texture is already the
+    /// cropped rectangle ([`Shape::crop`]) when it is asked.
     pub(crate) fn logical(self, buffer: (u32, u32)) -> (u32, u32) {
         if let Some(size) = self.viewport {
             return size;
@@ -118,22 +122,49 @@ impl Shape {
         (buffer.0 / s, buffer.1 / s)
     }
 
+    /// The rectangle of a `buffer`-pixel buffer that is the surface's picture:
+    /// `x, y, width, height` in buffer pixels. The viewport's source, scaled
+    /// to buffer pixels and kept inside the buffer, else the whole buffer.
+    ///
+    /// A client that sets one is drawing into part of a bigger buffer —
+    /// Chromium keeps its buffer when a window shrinks and crops it — and the
+    /// texture is only that part, so a shell drawing the texture whole draws
+    /// what the client meant. A source that misses the buffer is a protocol
+    /// error glasspane does not raise; it gets the whole buffer.
+    pub(crate) fn crop(self, buffer: (u32, u32)) -> (u32, u32, u32, u32) {
+        let whole = (0, 0, buffer.0, buffer.1);
+        let Some((x, y, w, h)) = self.source else {
+            return whole;
+        };
+        let s = f64::from(self.buffer_scale.max(1));
+        let (bw, bh) = (f64::from(buffer.0), f64::from(buffer.1));
+        let (x0, y0) = ((x * s).round().clamp(0.0, bw), (y * s).round().clamp(0.0, bh));
+        let (x1, y1) = (((x + w) * s).round().clamp(0.0, bw), ((y + h) * s).round().clamp(0.0, bh));
+        if x1 <= x0 || y1 <= y0 {
+            return whole;
+        }
+        (x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32)
+    }
+
     fn of(states: &smithay::wayland::compositor::SurfaceData) -> Shape {
         let buffer_scale = states
             .cached_state
             .get::<SurfaceAttributes>()
             .current()
             .buffer_scale;
-        let viewport = states
-            .cached_state
-            .get::<ViewportCachedState>()
-            .current()
+        let mut cached = states.cached_state.get::<ViewportCachedState>();
+        let port = cached.current();
+        let viewport = port
             .size()
             .filter(|s| s.w > 0 && s.h > 0)
             .map(|s| (s.w as u32, s.h as u32));
+        let source = port
+            .src
+            .map(|r| (r.loc.x, r.loc.y, r.size.w, r.size.h));
         Shape {
             buffer_scale,
             viewport,
+            source,
         }
     }
 }
@@ -392,9 +423,9 @@ impl State {
         }
     }
 
-    /// Make sure this surface's texture is `width` x `height` and its logical
-    /// size is what `shape` makes of that, recreating the texture if it has
-    /// to and saying so if either moved.
+    /// Make sure this surface's texture is `width` x `height` — its buffer,
+    /// cropped — and its logical size is what `shape` makes of that,
+    /// recreating the texture if it has to and saying so if either moved.
     fn ensure_texture(&mut self, slot: Slot, width: u32, height: u32, shape: Shape) {
         let size = shape.logical((width, height));
         let fits = self
@@ -499,13 +530,14 @@ impl State {
             })
             .map_err(|e| format!("dmabuf import failed: {e}"))?;
 
-        self.ensure_texture(slot, width, height, shape);
+        let crop = shape.crop((width, height));
+        self.ensure_texture(slot, crop.2, crop.3, shape);
         let dst = self
             .skin(slot)
             .texture
             .clone()
             .expect("ensure_texture just set it");
-        texture::blit(&self.device, &self.queue, &src, &dst, width, height);
+        texture::blit(&self.device, &self.queue, &src, &dst, crop);
         Ok(())
     }
 
@@ -541,13 +573,14 @@ impl State {
             Err(e) => return Err(format!("buffer is neither dma-buf nor wl_shm: {e}")),
         };
         self.skin_mut(slot).acquire_staged = false;
-        self.ensure_texture(slot, w, h, shape);
+        let crop = shape.crop((w, h));
+        self.ensure_texture(slot, crop.2, crop.3, shape);
         let dst = self
             .skin(slot)
             .texture
             .clone()
             .expect("ensure_texture just set it");
-        texture::upload_shm(&self.queue, &dst, &bytes, stride, w, h);
+        texture::upload_shm(&self.queue, &dst, &bytes, stride, crop);
         Ok(())
     }
 }
@@ -1245,23 +1278,46 @@ impl State {
 
 #[cfg(test)]
 mod tests {
+    /// Chromium shrunk to 1434x551 keeps its 1920x1200 buffer and crops it:
+    /// the texture is the cropped corner, not the whole buffer squeezed.
+    #[test]
+    fn a_viewport_source_is_the_part_of_the_buffer_drawn() {
+        let cropped = super::Shape {
+            buffer_scale: 1,
+            viewport: Some((1434, 551)),
+            source: Some((0.0, 0.0, 1434.0, 551.0)),
+        };
+        assert_eq!(cropped.crop((1920, 1200)), (0, 0, 1434, 551));
+        assert_eq!(cropped.logical((1434, 551)), (1434, 551));
+        // In logical pixels: at buffer scale 2 it is twice as many texels.
+        let scaled = super::Shape { buffer_scale: 2, source: Some((10.0, 5.0, 100.0, 50.0)), ..cropped };
+        assert_eq!(scaled.crop((1920, 1200)), (20, 10, 200, 100));
+        // Kept inside the buffer; a source wholly off it is no crop.
+        let over = super::Shape { source: Some((1800.0, 0.0, 400.0, 100.0)), ..cropped };
+        assert_eq!(over.crop((1920, 1200)), (1800, 0, 120, 100));
+        let off = super::Shape { source: Some((2000.0, 0.0, 10.0, 10.0)), ..cropped };
+        assert_eq!(off.crop((1920, 1200)), (0, 0, 1920, 1200));
+        let none = super::Shape { source: None, ..cropped };
+        assert_eq!(none.crop((1920, 1200)), (0, 0, 1920, 1200));
+    }
+
     #[test]
     fn a_viewport_destination_is_the_logical_size() {
-        let shape = super::Shape { buffer_scale: 1, viewport: Some((390, 520)) };
+        let shape = super::Shape { buffer_scale: 1, viewport: Some((390, 520)), source: None };
         assert_eq!(shape.logical((819, 1092)), (390, 520));
     }
 
     #[test]
     fn without_a_viewport_the_buffer_is_divided_by_its_scale() {
-        let shape = super::Shape { buffer_scale: 2, viewport: None };
+        let shape = super::Shape { buffer_scale: 2, viewport: None, source: None };
         assert_eq!(shape.logical((780, 1040)), (390, 520));
-        let shape = super::Shape { buffer_scale: 1, viewport: None };
+        let shape = super::Shape { buffer_scale: 1, viewport: None, source: None };
         assert_eq!(shape.logical((390, 520)), (390, 520));
     }
 
     #[test]
     fn a_nonsense_buffer_scale_is_read_as_one() {
-        let shape = super::Shape { buffer_scale: 0, viewport: None };
+        let shape = super::Shape { buffer_scale: 0, viewport: None, source: None };
         assert_eq!(shape.logical((390, 520)), (390, 520));
     }
 

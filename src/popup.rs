@@ -110,8 +110,9 @@ impl Popup {
         self.skin.size
     }
 
-    /// The size of the last committed buffer in pixels, which is the
-    /// texture's size. `(0, 0)` before the first commit.
+    /// The size of the last committed buffer in pixels, cropped to its
+    /// viewport's source if it sets one: the texture's size. `(0, 0)` before
+    /// the first commit.
     pub fn buffer_size(&self) -> (u32, u32) {
         self.skin.buffer
     }
