@@ -45,6 +45,8 @@ pub struct Tenant {
     pub(crate) skin: Skin,
     pub(crate) surface: WlSurface,
     pub(crate) toplevel: ToplevelSurface,
+    /// Frame callbacks answered for this tenant and its popups.
+    pub(crate) callbacks_sent: u64,
 }
 
 impl Tenant {
@@ -127,6 +129,13 @@ impl Tenant {
     /// `wl_buffer`.
     pub fn generation(&self) -> u64 {
         self.skin.generation
+    }
+
+    /// Frame callbacks answered for this tenant, its popups' included, over
+    /// its life: how often it has been let paint. See
+    /// [`crate::Glasspane::tick_where`] for a shell that paces tenants apart.
+    pub fn callbacks_sent(&self) -> u64 {
+        self.callbacks_sent
     }
 
     /// Whether the last dma-buf commit's acquire fence was staged as a wait on

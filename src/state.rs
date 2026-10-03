@@ -237,7 +237,12 @@ pub struct State {
     /// Where the keyboard was before the grab took it, to put it back.
     pub(crate) focus_before_grab: Option<Target>,
     pub(crate) events: VecDeque<Event>,
-    pub(crate) pending_callbacks: Vec<WlCallback>,
+    /// Frame callbacks harvested at commit and not yet answered, each with
+    /// the tenant it belongs to: a toplevel's own, and a popup's its root
+    /// tenant's, so a shell that paces a pane paces its menus with it.
+    /// `None` for a surface that is neither (nothing to pace it by), which
+    /// every release answers.
+    pub(crate) pending_callbacks: Vec<(Option<TenantId>, WlCallback)>,
     pub(crate) default_size: (u32, u32),
     pub(crate) keyboard_focus: Option<Target>,
     pub(crate) pointer_focus: Option<Target>,
@@ -359,22 +364,58 @@ impl State {
         let _ = self.dh.clone().flush_clients();
     }
 
-    /// Answer every frame callback harvested since the last tick, and say how
-    /// many were answered.
+    /// Answer the frame callbacks harvested since the last tick of every
+    /// tenant `due` picks, leave the rest pending, and say how many were
+    /// answered.
     ///
     /// Frame callbacks are the compositor's to *drive* (see the crate docs): a
     /// Wayland client paints only when handed one, so answering them on demand
-    /// collapses to "when someone asks" and the tenants freeze.
-    pub(crate) fn release_frame_callbacks(&mut self, now_ms: u32) -> usize {
+    /// collapses to "when someone asks" and the tenants freeze. Withholding
+    /// one from a tenant is how a shell slows it down: it is held, not
+    /// dropped, so the tenant paints again the tick it is picked.
+    ///
+    /// `due` is asked once per tenant holding a pending callback, and only
+    /// then: a tenant it says yes to is one that got callbacks this tick.
+    /// Callbacks of a surface that belongs to no live tenant are always
+    /// answered; those of a client that has gone are dropped.
+    pub(crate) fn release_frame_callbacks(&mut self, now_ms: u32, mut due: impl FnMut(TenantId) -> bool) -> usize {
         self.ticks += 1;
         if self.pending_callbacks.is_empty() {
             return 0;
         }
+        let mut asked: Vec<(TenantId, bool)> = Vec::new();
+        let mut kept = Vec::new();
         let mut n = 0;
-        for cb in std::mem::take(&mut self.pending_callbacks) {
+        for (owner, cb) in std::mem::take(&mut self.pending_callbacks) {
+            if !cb.is_alive() {
+                continue;
+            }
+            let index = owner.and_then(|id| self.index_of(id));
+            let go = match (owner, index) {
+                (Some(id), Some(_)) => match asked.iter().find(|(a, _)| *a == id) {
+                    Some((_, go)) => *go,
+                    None => {
+                        let go = due(id);
+                        asked.push((id, go));
+                        go
+                    }
+                },
+                _ => true,
+            };
+            if !go {
+                kept.push((owner, cb));
+                continue;
+            }
             cb.done(now_ms);
             self.callbacks_sent += 1;
+            if let Some(i) = index {
+                self.tenants[i].callbacks_sent += 1;
+            }
             n += 1;
+        }
+        self.pending_callbacks = kept;
+        if n == 0 {
+            return 0;
         }
         // A `done` is a *volunteered* event: no client request preceded it, so
         // nothing else will drag it out of the buffer. It must be flushed on
@@ -844,7 +885,13 @@ impl CompositorHandler for State {
             (buffer, callbacks, Shape::of(states))
         });
 
-        match self.slot_of_surface(surface) {
+        let slot = self.slot_of_surface(surface);
+        let owner = match slot {
+            Some(Slot::Tenant(index)) => Some(self.tenants[index].id),
+            Some(Slot::Popup(index)) => Some(self.popups[index].root),
+            None => None,
+        };
+        match slot {
             Some(Slot::Tenant(index)) => {
                 self.refresh_identity(index);
                 // The initial configure must be answered before a client is
@@ -879,8 +926,8 @@ impl CompositorHandler for State {
         }
 
         // Harvested, not answered: [`State::release_frame_callbacks`] answers
-        // them, on the caller's clock.
-        self.pending_callbacks.extend(callbacks);
+        // them, on the caller's clock, filed under the tenant they pace.
+        self.pending_callbacks.extend(callbacks.into_iter().map(|cb| (owner, cb)));
     }
 }
 
@@ -963,6 +1010,7 @@ impl XdgShellHandler for State {
             },
             surface,
             toplevel,
+            callbacks_sent: 0,
         });
         self.emit(Event::Mapped { id, pid });
         self.flush();

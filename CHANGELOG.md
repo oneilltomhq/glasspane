@@ -36,6 +36,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A `wp_viewport` source rectangle is honoured: the texture is that part of
   the buffer. Chromium, offered `wp_viewporter`, keeps a bigger buffer when a
   window shrinks and crops it, and without this was drawn whole and squeezed.
+- `Glasspane::tick_where`: answer the frame callbacks of the tenants a
+  predicate picks and hold the rest, so a shell can pace panes nobody sees
+  (a held callback is answered the tick its tenant is next picked). A popup's
+  callbacks count as its root tenant's. `tick` is `tick_where` picking all.
+- `Tenant::callbacks_sent`: the frame callbacks answered for a tenant and its
+  popups.
 
 ### Changed
 
