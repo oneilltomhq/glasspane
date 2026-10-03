@@ -674,3 +674,61 @@ fn a_scaled_tenant_paints_more_pixels_at_the_same_size() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// **Two tenants, two clocks.** `tick_where` hands callbacks to the tenants
+/// it picks and holds the rest: a tenant left out stops painting with its
+/// callback pending, the one picked goes on, and the tenant left out paints
+/// again the first tick it is picked, on the callback it was holding. The
+/// per-tenant count says which got what. What a shell pacing the panes it
+/// cannot see stands on.
+#[test]
+fn two_tenants_callbacks_are_released_apart() {
+    let Some((_adapter, device, queue)) = gpu() else {
+        return;
+    };
+    let mut pane = start("pace", None, device, queue);
+    let mut events = Vec::new();
+    let (_a_client, a) = map_tenant(&mut pane, Transport::Shm, &mut events);
+    let (_b_client, b) = map_tenant(&mut pane, Transport::Shm, &mut events);
+    // Both are painting, on `tick`; now only `a` is picked, and every tenant
+    // asked about is one holding a callback.
+    let turn = |pane: &mut Glasspane, pick: TenantId, asked: &mut Vec<TenantId>| {
+        pane.dispatch(Some(Duration::from_millis(4))).unwrap();
+        pane.tick_where(Instant::now(), |id| {
+            asked.push(id);
+            id == pick
+        });
+        let _ = pane.events().count();
+    };
+    let mut asked = Vec::new();
+    // Let `b`'s last paid frame land, so what follows starts from rest.
+    for _ in 0..20 {
+        turn(&mut pane, a, &mut asked);
+    }
+    let gen = |pane: &Glasspane, id: TenantId| pane.tenant(id).unwrap().generation();
+    let sent = |pane: &Glasspane, id: TenantId| pane.tenant(id).unwrap().callbacks_sent();
+    let (a0, b0, a_sent, b_sent) = (gen(&pane, a), gen(&pane, b), sent(&pane, a), sent(&pane, b));
+    // Until the picked one has painted ten more frames: long enough for the
+    // other to have painted as many, had it been paid.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while gen(&pane, a) < a0 + 10 && Instant::now() < deadline {
+        turn(&mut pane, a, &mut asked);
+    }
+    assert!(gen(&pane, a) >= a0 + 10, "the picked tenant painted {} frames in 5 s", gen(&pane, a) - a0);
+    assert!(sent(&pane, a) >= a_sent + 10, "the picked tenant was handed {} callbacks", sent(&pane, a) - a_sent);
+    assert_eq!(gen(&pane, b), b0, "the tenant left out painted");
+    assert_eq!(sent(&pane, b), b_sent, "the tenant left out was handed a callback");
+    assert!(asked.contains(&b), "the tenant left out was never asked about, so it held no callback");
+    let (callbacks, _) = pane.frame_stats();
+    assert_eq!(callbacks, sent(&pane, a) + sent(&pane, b), "the run's total is the tenants' sum");
+
+    // Picked once: the held callback is answered, and `b` paints again.
+    let b1 = gen(&pane, b);
+    turn(&mut pane, b, &mut asked);
+    assert_eq!(sent(&pane, b), b_sent + 1, "the held callback, answered on the first tick picked");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while gen(&pane, b) == b1 && Instant::now() < deadline {
+        turn(&mut pane, b, &mut asked);
+    }
+    assert!(gen(&pane, b) > b1, "the tenant picked again never painted");
+}

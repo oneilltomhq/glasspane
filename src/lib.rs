@@ -482,8 +482,31 @@ impl Glasspane {
     /// Zero is not an error: it means no tenant was waiting. A run in which it
     /// is *always* zero is a run in which nothing is painting.
     pub fn tick(&mut self, now: Instant) -> usize {
+        self.tick_where(now, |_| true)
+    }
+
+    /// **Drive the frame clock, tenant by tenant**: answer the harvested
+    /// frame callbacks of the tenants `due` picks, and hold the rest for a
+    /// later tick. Says how many were answered.
+    ///
+    /// Withholding callbacks is how a Wayland compositor slows a client
+    /// down: a tenant not handed one does not paint, and a browser not
+    /// painting runs no animation frames either. A shell with panes nobody
+    /// can see (folded away, off the screen, behind the camera) picks them
+    /// less often than the ones in view, and saves the work of drawing for
+    /// nobody. A held callback is answered the tick its tenant is next
+    /// picked, so a pane brought back into view paints at once.
+    ///
+    /// `due` is asked about each tenant holding a pending callback, once a
+    /// tick, and only those: a tenant it says yes to is one that was handed
+    /// callbacks this tick (so a caller can keep its own "last paid" time
+    /// per tenant from the answers). A popup's callbacks are its root
+    /// tenant's ([`Popup::root`]). A surface that belongs to no tenant is
+    /// always answered. The same contract as [`Glasspane::tick`] otherwise:
+    /// once per frame of your clock, unconditionally.
+    pub fn tick_where(&mut self, now: Instant, due: impl FnMut(TenantId) -> bool) -> usize {
         let ms = now.saturating_duration_since(self.state.start).as_millis() as u32;
-        self.state.release_frame_callbacks(ms)
+        self.state.release_frame_callbacks(ms, due)
     }
 
     /// Every live tenant, in no particular order.
