@@ -226,6 +226,8 @@ pub struct State {
 
     pub(crate) registry: Registry,
     pub(crate) acquire: Option<AcquireGate>,
+    /// The draw for dma-bufs in the other byte order, built on the first.
+    pub(crate) reorder: Option<texture::Reorder>,
     pub(crate) tenants: Vec<Tenant>,
     pub(crate) next_tenant: u64,
     pub(crate) popups: Vec<Popup>,
@@ -578,7 +580,14 @@ impl State {
             .texture
             .clone()
             .expect("ensure_texture just set it");
-        texture::blit(&self.device, &self.queue, &src, &dst, crop);
+        if src.format() == dst.format() {
+            texture::blit(&self.device, &self.queue, &src, &dst, crop);
+        } else {
+            let device = &self.device;
+            self.reorder
+                .get_or_insert_with(|| texture::Reorder::new(device))
+                .draw(device, &self.queue, &src, &dst, crop);
+        }
         Ok(())
     }
 
