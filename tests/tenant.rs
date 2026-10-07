@@ -10,7 +10,7 @@ mod fixture;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use fixture::{Fixture, Report, Transport};
+use fixture::{Fixture, Layout, Report, Transport};
 use glasspane::{Caps, Event, Glasspane, KeyState, TenantId};
 
 /// A GPU that can import a dma-buf *and* import an acquire fence, or `None`.
@@ -164,7 +164,17 @@ fn map_tenant(
     transport: Transport,
     events: &mut Vec<Event>,
 ) -> (Fixture, TenantId) {
-    let client = Fixture::start(pane.socket_name(), transport);
+    map_tree(pane, transport, Layout::Alone, events)
+}
+
+/// [`map_tenant`], for a fixture whose window is made of `layout`.
+fn map_tree(
+    pane: &mut Glasspane,
+    transport: Transport,
+    layout: Layout,
+    events: &mut Vec<Event>,
+) -> (Fixture, TenantId) {
+    let client = Fixture::start_with(pane.socket_name(), transport, layout);
     // Only events from here on: an earlier tenant's `Mapped` is still in the
     // log, and picking it up would make two clients look like one.
     let from = events.len();
@@ -759,4 +769,85 @@ fn two_tenants_callbacks_are_released_apart() {
         turn(&mut pane, b, &mut asked);
     }
     assert!(gen(&pane, b) > b1, "the tenant picked again never painted");
+}
+
+// ---------------------------------------------------------------------------
+// Subsurfaces
+// ---------------------------------------------------------------------------
+
+/// Bring up a fixture of `layout`, let its subsurface paint both its phases,
+/// and compare the whole texture with the tree drawn by hand. Returns what the
+/// client reported, for the caller's own assertions.
+fn tree_is_composited(tag: &str, transport: Transport, layout: Layout) -> Option<Vec<Report>> {
+    let (adapter, device, queue) = gpu()?;
+    let adapter = (transport == Transport::Dmabuf).then_some(&adapter);
+    let mut pane = start(tag, adapter, device, queue);
+    let mut events = Vec::new();
+    let (client, id) = map_tree(&mut pane, transport, layout, &mut events);
+
+    // The subsurface's second frame is painted on its own frame callback,
+    // which only the tick hands out; wait for the client to say it sent it,
+    // then for one more dispatch to have drawn it.
+    let mut reports = Vec::new();
+    let painted = pump(&mut pane, &mut events, Duration::from_secs(10), |_, _| {
+        reports.extend(client.drain());
+        reports.iter().any(|r| matches!(r, Report::SubCommitted { phase: 1, .. }))
+    });
+    assert!(painted, "the subsurface never painted its second frame; it reported {reports:?}");
+    pump(&mut pane, &mut events, Duration::from_millis(100), |_, _| false);
+    reports.extend(client.drain());
+
+    let (w, h) = pane.tenant(id).unwrap().size();
+    assert_eq!((w, h), (256, 256));
+    assert_eq!(
+        pane.tenant(id).unwrap().buffer_size(),
+        (256, 256),
+        "the texture is the tree's logical size, whatever the root's buffer is"
+    );
+    let got = read_back(&pane, id);
+    assert_eq!(
+        first_difference(&got, &fixture::expected_tree(layout, w, h, 1), w),
+        None,
+        "the tenant texture is not the parent with its subsurface drawn over it"
+    );
+    Some(reports)
+}
+
+/// **A desync subsurface is drawn into its toplevel's texture**, at its
+/// position, over the parent — the way Wine draws a menu.
+///
+/// The parent commits exactly once. The subsurface commits twice, the second
+/// time alone, on its own frame callback; the texture is read back after that
+/// and must show the parent's lattice everywhere except the subsurface's
+/// rectangle, which must show its *second* frame. So a desync commit redraws
+/// the texture without the parent, and the parent's pixels survive it.
+#[test]
+fn a_desync_subsurface_is_composited_over_its_parent() {
+    let Some(reports) = tree_is_composited("sub-shm", Transport::Shm, Layout::Subsurface) else {
+        return;
+    };
+    let parent_commits = reports
+        .iter()
+        .filter(|r| matches!(r, Report::Committed { .. }))
+        .count();
+    assert_eq!(
+        parent_commits, 1,
+        "the parent committed more than once, so the redraw proves nothing: {reports:?}"
+    );
+}
+
+/// The same tree with the parent a dma-buf: both upload paths can fill a
+/// layer, not only the texture.
+#[test]
+fn a_subsurface_over_a_dmabuf_parent_is_composited() {
+    let _ = tree_is_composited("sub-dmabuf", Transport::Dmabuf, Layout::Subsurface);
+}
+
+/// **Waydroid's window**: a 1x1 black buffer stretched over the toplevel by
+/// a viewport, and the picture in a subsurface. The texture must be the
+/// toplevel's whole size, black where the root shows, and the subsurface
+/// hanging past the corner cut at the toplevel's edge.
+#[test]
+fn a_stretched_root_is_composited_at_its_logical_size() {
+    let _ = tree_is_composited("sub-stretched", Transport::Shm, Layout::Stretched);
 }

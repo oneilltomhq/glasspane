@@ -10,7 +10,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use smithay::backend::allocator::dmabuf::Dmabuf;
@@ -28,8 +28,9 @@ use smithay::reexports::wayland_server::{Client, DisplayHandle, Resource};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::utils::Transform;
 use smithay::wayland::compositor::{
-    BufferAssignment, CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes,
-    send_surface_state, with_states,
+    BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
+    SubsurfaceCachedState, SurfaceAttributes, SurfaceData, TraversalAction, get_children,
+    get_parent, send_surface_state, with_states, with_surface_tree_upward,
 };
 use smithay::wayland::fractional_scale::{
     FractionalScaleHandler, FractionalScaleManagerState, with_fractional_scale,
@@ -55,6 +56,7 @@ use crate::input::Target;
 use crate::popup::{Parent, Popup, PopupId};
 use crate::registry::{BufferKey, Registry};
 use crate::tenant::{Tenant, TenantId};
+use crate::compose::{Compositor, Quad};
 use crate::texture::Skin;
 use crate::{texture, Event};
 
@@ -146,7 +148,7 @@ impl Shape {
         (x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32)
     }
 
-    fn of(states: &smithay::wayland::compositor::SurfaceData) -> Shape {
+    fn of(states: &SurfaceData) -> Shape {
         let buffer_scale = states
             .cached_state
             .get::<SurfaceAttributes>()
@@ -240,8 +242,9 @@ pub struct State {
     pub(crate) focus_before_grab: Option<Target>,
     pub(crate) events: VecDeque<Event>,
     /// Frame callbacks harvested at commit and not yet answered, each with
-    /// the tenant it belongs to: a toplevel's own, and a popup's its root
-    /// tenant's, so a shell that paces a pane paces its menus with it.
+    /// the tenant it belongs to: a toplevel's own, and a popup's or a
+    /// subsurface's its root tenant's, so a shell that paces a pane paces its
+    /// menus with it.
     /// `None` for a surface that is neither (nothing to pace it by), which
     /// every release answers.
     pub(crate) pending_callbacks: Vec<(Option<TenantId>, WlCallback)>,
@@ -250,6 +253,15 @@ pub struct State {
     pub(crate) pointer_focus: Option<Target>,
     pub(crate) ticks: u64,
     pub(crate) callbacks_sent: u64,
+    /// Built the first time a tenant or popup has subsurfaces to draw, and
+    /// never for a run without one.
+    pub(crate) compositor: Option<Compositor>,
+    /// The root surfaces — a tenant's or a popup's — of trees that a commit
+    /// changed since the last [`State::compose_trees`]. Drawn once per
+    /// dispatch however many of their surfaces committed: a synchronized
+    /// tree applies all its children's commits along with its parent's, and
+    /// drawing after each would draw the same picture several times.
+    pub(crate) dirty_trees: Vec<WlSurface>,
 }
 
 impl std::fmt::Debug for State {
@@ -466,11 +478,11 @@ impl State {
         }
     }
 
-    /// Make sure this surface's texture is `width` x `height` — its buffer,
-    /// cropped — and its logical size is what `shape` makes of that,
+    /// Make sure this surface's texture is `texture` texels — its buffer,
+    /// cropped, or its tree's composite — and its logical size is `size`,
     /// recreating the texture if it has to and saying so if either moved.
-    fn ensure_texture(&mut self, slot: Slot, width: u32, height: u32, shape: Shape) {
-        let size = shape.logical((width, height));
+    fn ensure_texture(&mut self, slot: Slot, texture: (u32, u32), size: (u32, u32)) {
+        let (width, height) = texture;
         let fits = self
             .skin(slot)
             .texture
@@ -503,46 +515,97 @@ impl State {
         self.emit(event);
     }
 
-    /// One committed buffer becomes texels.
-    fn absorb_buffer(&mut self, slot: Slot, buffer: &WlBuffer, shape: Shape) {
-        let key = buffer_key(buffer);
+    /// The tenant a slot's pixels belong to, as far as a shell watching for
+    /// trouble is concerned: a popup's are its root tenant's.
+    fn owner_of(&self, slot: Slot) -> TenantId {
+        match slot {
+            Slot::Tenant(i) => self.tenants[i].id,
+            Slot::Popup(i) => self.popups[i].root,
+        }
+    }
 
-        let result = match get_dmabuf(buffer) {
-            Ok(dmabuf) => self.absorb_dmabuf(slot, key, &dmabuf.clone(), shape),
-            Err(_) => self.absorb_shm(slot, buffer, shape),
+    /// Say that the texture behind `slot` has new pixels.
+    fn committed(&mut self, slot: Slot) {
+        self.skin_mut(slot).generation += 1;
+        let generation = self.skin(slot).generation;
+        let event = match slot {
+            Slot::Tenant(i) => Event::Committed {
+                id: self.tenants[i].id,
+                generation,
+            },
+            Slot::Popup(i) => Event::PopupCommitted {
+                id: self.popups[i].id,
+                generation,
+            },
         };
+        self.emit(event);
+    }
 
-        match result {
-            Ok(()) => {
-                self.skin_mut(slot).generation += 1;
-                let generation = self.skin(slot).generation;
-                let event = match slot {
-                    Slot::Tenant(i) => Event::Committed {
-                        id: self.tenants[i].id,
-                        generation,
-                    },
-                    Slot::Popup(i) => Event::PopupCommitted {
-                        id: self.popups[i].id,
-                        generation,
-                    },
-                };
-                self.emit(event);
-            }
+    /// One committed buffer becomes texels: the fast path, for a surface with
+    /// no subsurfaces, straight into its texture.
+    fn absorb_buffer(&mut self, slot: Slot, buffer: &WlBuffer, shape: Shape) {
+        match self.absorb_into(Dest::Skin(slot), buffer, shape) {
+            Ok(()) => self.committed(slot),
             Err(why) => {
-                let id = match slot {
-                    Slot::Tenant(i) => Some(self.tenants[i].id),
-                    // A popup's pixels belong to its root tenant as far as a
-                    // shell watching for trouble is concerned.
-                    Slot::Popup(i) => Some(self.popups[i].root),
-                };
-                self.reject(id, why);
+                let id = self.owner_of(slot);
+                self.reject(Some(id), why);
             }
         }
     }
 
+    /// Put a buffer's pixels at `dest`, by whichever path its memory needs.
+    fn absorb_into(&mut self, dest: Dest<'_>, buffer: &WlBuffer, shape: Shape) -> Result<(), String> {
+        match get_dmabuf(buffer) {
+            Ok(dmabuf) => self.absorb_dmabuf(dest, buffer_key(buffer), &dmabuf.clone(), shape),
+            Err(_) => self.absorb_shm(dest, buffer, shape),
+        }
+    }
+
+    /// The texture a buffer of `crop` texels is written into at `dest`, made
+    /// to fit first.
+    fn target(&mut self, dest: Dest<'_>, crop: (u32, u32), shape: Shape, opaque: bool) -> Arc<wgpu::Texture> {
+        match dest {
+            Dest::Skin(slot) => {
+                self.ensure_texture(slot, crop, shape.logical(crop));
+                self.skin(slot)
+                    .texture
+                    .clone()
+                    .expect("ensure_texture just set it")
+            }
+            Dest::Layer(surface, _) => {
+                let device = &self.device;
+                with_states(surface, |states| {
+                    let mut layer = layer_of(states).lock().unwrap();
+                    let fits = layer
+                        .texture
+                        .as_ref()
+                        .is_some_and(|t| (t.width(), t.height()) == crop);
+                    if !fits {
+                        let label = format!("layer@{}", surface.id().protocol_id());
+                        let tex = texture::create_surface_texture(device, &label, crop.0, crop.1);
+                        layer.texture = Some(Arc::new(tex));
+                    }
+                    layer.size = shape.logical(crop);
+                    layer.opaque = opaque;
+                    layer.texture.clone().expect("just set")
+                })
+            }
+        }
+    }
+
+    /// Record whether the last dma-buf commit staged an acquire wait, on the
+    /// skin the pixels end up in.
+    fn set_staged(&mut self, dest: Dest<'_>, staged: bool) {
+        let slot = match dest {
+            Dest::Skin(slot) | Dest::Layer(_, Some(slot)) => slot,
+            Dest::Layer(_, None) => return,
+        };
+        self.skin_mut(slot).acquire_staged = staged;
+    }
+
     fn absorb_dmabuf(
         &mut self,
-        slot: Slot,
+        dest: Dest<'_>,
         key: BufferKey,
         dmabuf: &Dmabuf,
         shape: Shape,
@@ -558,12 +621,13 @@ impl State {
                 .next()
                 .ok_or_else(|| "dmabuf has no plane handle".to_string())?;
             gate.wait_for(key, plane)?;
-            self.skin_mut(slot).acquire_staged = true;
+            self.set_staged(dest, true);
         } else {
-            self.skin_mut(slot).acquire_staged = false;
+            self.set_staged(dest, false);
         }
 
         let (width, height) = (dmabuf.width(), dmabuf.height());
+        let opaque = dmabuf.format().code == drm_fourcc::DrmFourcc::Xrgb8888;
         let device = self.device.clone();
         let described = crate::convert::describe(dmabuf)?;
         let (_id, src, _imported) = self
@@ -574,12 +638,7 @@ impl State {
             .map_err(|e| format!("dmabuf import failed: {e}"))?;
 
         let crop = shape.crop((width, height));
-        self.ensure_texture(slot, crop.2, crop.3, shape);
-        let dst = self
-            .skin(slot)
-            .texture
-            .clone()
-            .expect("ensure_texture just set it");
+        let dst = self.target(dest, (crop.2, crop.3), shape, opaque);
         if src.format() == dst.format() {
             texture::blit(&self.device, &self.queue, &src, &dst, crop);
         } else {
@@ -591,12 +650,13 @@ impl State {
         Ok(())
     }
 
-    fn absorb_shm(&mut self, slot: Slot, buffer: &WlBuffer, shape: Shape) -> Result<(), String> {
+    fn absorb_shm(&mut self, dest: Dest<'_>, buffer: &WlBuffer, shape: Shape) -> Result<(), String> {
         let read = with_buffer_contents(buffer, |ptr, len, data| {
-            match data.format {
-                wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888 => {}
+            let opaque = match data.format {
+                wl_shm::Format::Argb8888 => false,
+                wl_shm::Format::Xrgb8888 => true,
                 other => return Err(format!("unsupported wl_shm format {other:?}")),
-            }
+            };
             let (w, h, stride, offset) = (
                 data.width.max(0) as u32,
                 data.height.max(0) as u32,
@@ -615,21 +675,16 @@ impl State {
             // the duration of this closure, and the bounds above are checked
             // against `len` rather than against the client's word for it.
             let bytes = unsafe { std::slice::from_raw_parts(ptr.add(offset), needed) }.to_vec();
-            Ok((w, h, stride, bytes))
+            Ok((w, h, stride, bytes, opaque))
         });
-        let (w, h, stride, bytes) = match read {
+        let (w, h, stride, bytes, opaque) = match read {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => return Err(e),
             Err(e) => return Err(format!("buffer is neither dma-buf nor wl_shm: {e}")),
         };
-        self.skin_mut(slot).acquire_staged = false;
+        self.set_staged(dest, false);
         let crop = shape.crop((w, h));
-        self.ensure_texture(slot, crop.2, crop.3, shape);
-        let dst = self
-            .skin(slot)
-            .texture
-            .clone()
-            .expect("ensure_texture just set it");
+        let dst = self.target(dest, (crop.2, crop.3), shape, opaque);
         texture::upload_shm(&self.queue, &dst, &bytes, stride, crop);
         Ok(())
     }
@@ -869,6 +924,313 @@ impl State {
 }
 
 // ---------------------------------------------------------------------------
+// Subsurfaces
+// ---------------------------------------------------------------------------
+
+/// Where a committed buffer's pixels are put.
+#[derive(Debug, Clone, Copy)]
+enum Dest<'a> {
+    /// Straight into a tenant's or a popup's texture: a surface with no
+    /// subsurfaces, which is most of them.
+    Skin(Slot),
+    /// Into a surface's own [`Layer`], to be composited into its tree's
+    /// texture: a subsurface, or a root that has some. The slot is the root's,
+    /// if this crate hosts it yet.
+    Layer(&'a WlSurface, Option<Slot>),
+}
+
+/// One surface of a tree's own pixels, kept on the surface (in its
+/// `data_map`, so it goes when the surface does) until the tree is drawn.
+///
+/// A copy per surface on top of the composite is the cost of drawing a tree:
+/// a desync subsurface commits alone, and its parent's pixels have to be
+/// somewhere to be drawn under it again. A client without subsurfaces never
+/// gets one.
+#[derive(Debug, Default)]
+struct Layer {
+    /// The buffer, cropped to its viewport's source; `None` once the client
+    /// attaches a null buffer, which unmaps the surface.
+    texture: Option<Arc<wgpu::Texture>>,
+    /// The logical size it is drawn at: [`Shape::logical`] of the texture.
+    size: (u32, u32),
+    /// `XRGB8888`: drawn as if its alpha were 1. See [`Quad::opaque`].
+    opaque: bool,
+}
+
+fn layer_of(states: &SurfaceData) -> &Mutex<Layer> {
+    states.data_map.get_or_insert_threadsafe(Mutex::<Layer>::default)
+}
+
+/// Where a surface of a tree is, given where its parent is: `None` for a
+/// surface that is not drawn, because it has no buffer or because its parent
+/// is not drawn.
+fn place_of(states: &SurfaceData, parent: Option<(i32, i32)>) -> Option<(i32, i32)> {
+    let (x, y) = parent?;
+    let mapped = matches!(
+        states.cached_state.get::<SurfaceAttributes>().current().buffer,
+        Some(BufferAssignment::NewBuffer(_))
+    );
+    if !mapped {
+        return None;
+    }
+    if states.role != Some(SUBSURFACE) {
+        return Some((x, y));
+    }
+    let at = states.cached_state.get::<SubsurfaceCachedState>().current().location;
+    Some((x + at.x, y + at.y))
+}
+
+/// smithay's name for the role `wl_subcompositor.get_subsurface` gives.
+const SUBSURFACE: &str = "subsurface";
+
+/// One drawn surface of a tree, as [`walk`] finds it.
+struct Piece {
+    surface: WlSurface,
+    /// Its top-left in the root's logical pixels.
+    at: (i32, i32),
+    /// The buffer it holds, for a layer that was never filled.
+    buffer: Option<WlBuffer>,
+    shape: Shape,
+    layer: Option<(Arc<wgpu::Texture>, (u32, u32), bool)>,
+}
+
+fn layer_snapshot(states: &SurfaceData) -> Option<(Arc<wgpu::Texture>, (u32, u32), bool)> {
+    let layer = layer_of(states).lock().unwrap();
+    layer.texture.clone().map(|t| (t, layer.size, layer.opaque))
+}
+
+/// Every drawn surface of the tree under `root`, back to front, and a hash of
+/// the tree's shape: which surfaces there are, in what order, and where.
+///
+/// Back to front is smithay's upward walk, which honours `place_above` and
+/// `place_below` — including a subsurface placed below its own parent, which
+/// is drawn before it.
+fn walk(root: &WlSurface) -> (Vec<Piece>, u64) {
+    let mut pieces = Vec::new();
+    let mut hash = DefaultHasher::new();
+    with_surface_tree_upward(
+        root,
+        Some((0, 0)),
+        |_, states, parent| TraversalAction::DoChildren(place_of(states, *parent)),
+        |surface, states, parent| {
+            let at = place_of(states, *parent);
+            surface.id().hash(&mut hash);
+            at.hash(&mut hash);
+            let Some(at) = at else {
+                return;
+            };
+            let buffer = match &states.cached_state.get::<SurfaceAttributes>().current().buffer {
+                Some(BufferAssignment::NewBuffer(b)) => Some(b.clone()),
+                _ => None,
+            };
+            pieces.push(Piece {
+                surface: surface.clone(),
+                at,
+                buffer,
+                shape: Shape::of(states),
+                layer: layer_snapshot(states),
+            });
+        },
+        |_, _, _| true,
+    );
+    (pieces, hash.finish())
+}
+
+/// The size of a tree's composite texture: the root's logical size, at the
+/// denser of the root's own buffer and the scale the tenant was asked for.
+///
+/// Not simply the root's buffer, because the root's buffer can be a token:
+/// Waydroid's is 1x1, stretched over the window by a viewport, with all of
+/// Android in a subsurface on top. A composite the size of that buffer would
+/// be one pixel.
+fn composite_size(root: (u32, u32), logical: (u32, u32), scale: f64) -> (u32, u32) {
+    let asked = |l: u32| (f64::from(l) * scale).round().max(1.0) as u32;
+    (root.0.max(asked(logical.0)), root.1.max(asked(logical.1)))
+}
+
+/// The root of the subsurface tree `surface` is in: the surface at the top of
+/// its chain of `wl_subsurface` parents, itself if it has none.
+fn root_of(surface: &WlSurface) -> WlSurface {
+    let mut at = surface.clone();
+    while let Some(parent) = get_parent(&at) {
+        at = parent;
+    }
+    at
+}
+
+/// Every subsurface under `surface`, at any depth.
+pub(crate) fn subsurfaces_of(surface: &WlSurface) -> Vec<WlSurface> {
+    let mut out = Vec::new();
+    let mut frontier = get_children(surface);
+    while let Some(next) = frontier.pop() {
+        frontier.extend(get_children(&next));
+        out.push(next);
+    }
+    out
+}
+
+impl State {
+    /// A root's commit: its own buffer, and — when its tree is synchronized —
+    /// its children's, which smithay has just applied and committed first.
+    ///
+    /// **A root with no subsurfaces takes the path it always has**: its
+    /// buffer straight into its texture, no layer, no composite, no pipeline.
+    /// What a subsurface costs is paid only by a client that makes one.
+    fn absorb_root(&mut self, slot: Slot, surface: &WlSurface, buffer: Option<Option<WlBuffer>>, shape: Shape) {
+        if get_children(surface).is_empty() {
+            if self.skin_mut(slot).tree.take().is_some() {
+                // It had a tree, and has drawn alone since: its layer is a
+                // copy nothing will read.
+                with_states(surface, |states| layer_of(states).lock().unwrap().texture = None);
+            }
+            if let Some(Some(buffer)) = buffer {
+                self.absorb_buffer(slot, &buffer, shape);
+            }
+            return;
+        }
+        self.absorb_layer(surface, Some(slot), buffer, shape);
+    }
+
+    /// A tree surface's commit: its buffer into its layer, a null buffer out
+    /// of it, and the tree marked for drawing either way, since a commit may
+    /// also have moved it.
+    fn absorb_layer(&mut self, surface: &WlSurface, root: Option<Slot>, buffer: Option<Option<WlBuffer>>, shape: Shape) {
+        match buffer {
+            Some(Some(buffer)) => {
+                if let Err(why) = self.absorb_into(Dest::Layer(surface, root), &buffer, shape) {
+                    let id = root.map(|s| self.owner_of(s));
+                    self.reject(id, why);
+                }
+            }
+            Some(None) => with_states(surface, |states| layer_of(states).lock().unwrap().texture = None),
+            None => {}
+        }
+        if let Some(slot) = root {
+            let root = self.surface_of(slot);
+            if !self.dirty_trees.contains(&root) {
+                self.dirty_trees.push(root);
+            }
+        }
+    }
+
+    /// Draw every tree that changed since the last call. Once per dispatch,
+    /// after the client requests in it, so a synchronized tree whose parent
+    /// and children all applied in one go is drawn once.
+    ///
+    /// A tree can also change with no commit to say so — a subsurface
+    /// destroyed, or restacked (smithay applies `place_above` at once) — so
+    /// every composited tree's shape is re-read here, which is a walk of a
+    /// few surfaces, and the tree is redrawn if it moved.
+    pub(crate) fn compose_trees(&mut self) {
+        let mut roots = std::mem::take(&mut self.dirty_trees);
+        let slots = (0..self.tenants.len())
+            .map(Slot::Tenant)
+            .chain((0..self.popups.len()).map(Slot::Popup));
+        for slot in slots {
+            let Some(drawn) = self.skin(slot).tree else {
+                continue;
+            };
+            let root = self.surface_of(slot);
+            if walk(&root).1 != drawn && !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
+        for root in roots {
+            if let Some(slot) = self.slot_of_surface(&root) {
+                self.compose(slot);
+            }
+        }
+    }
+
+    /// Draw one tree into its root's texture.
+    ///
+    /// Each surface is drawn at its position and its logical size, in the
+    /// root's logical pixels scaled to the texture; a viewport destination or
+    /// a buffer scale is in that logical size already, and a viewport source
+    /// in the layer's crop. **Whatever falls outside the root's own rectangle
+    /// is clipped**: the texture is the root's size, the size the shell draws
+    /// the pane at and hit-tests in, and a menu hanging past the window's edge
+    /// is cut there. That is a limit, not a design: a client that does it
+    /// expects the overhang to be seen.
+    fn compose(&mut self, slot: Slot) {
+        let root = self.surface_of(slot);
+        let (mut pieces, shape) = walk(&root);
+        // A surface whose pixels were never taken into a layer is read now,
+        // from the buffer it still holds: the root, which drew straight into
+        // its texture until it had subsurfaces, and a subsurface that
+        // committed before its tree belonged to a tenant.
+        for piece in &mut pieces {
+            if piece.layer.is_some() {
+                continue;
+            }
+            let Some(buffer) = piece.buffer.clone() else {
+                continue;
+            };
+            match self.absorb_into(Dest::Layer(&piece.surface, Some(slot)), &buffer, piece.shape) {
+                Ok(()) => piece.layer = with_states(&piece.surface, layer_snapshot),
+                Err(why) => {
+                    let id = self.owner_of(slot);
+                    self.reject(Some(id), why);
+                }
+            }
+        }
+        self.skin_mut(slot).tree = Some(shape);
+        // Nothing to draw over: an unmapped root hides its whole tree, and
+        // the texture keeps its last picture, as a surface drawn alone does.
+        let Some((base, logical, _)) = pieces
+            .iter()
+            .find(|p| p.surface == root)
+            .and_then(|p| p.layer.clone())
+        else {
+            return;
+        };
+        if logical.0 == 0 || logical.1 == 0 {
+            return;
+        }
+        let scale = match slot {
+            Slot::Tenant(i) => self.tenants[i].scale,
+            Slot::Popup(i) => self
+                .index_of(self.popups[i].root)
+                .map_or(1.0, |t| self.tenants[t].scale),
+        };
+        let size = composite_size((base.width(), base.height()), logical, scale);
+        self.ensure_texture(slot, size, logical);
+        let target = self.skin(slot).texture.clone().expect("ensure_texture just set it");
+        let (sx, sy) = (
+            size.0 as f32 / logical.0 as f32,
+            size.1 as f32 / logical.1 as f32,
+        );
+        let quads: Vec<Quad<'_>> = pieces
+            .iter()
+            .filter_map(|p| {
+                let (texture, (w, h), opaque) = p.layer.as_ref()?;
+                Some(Quad {
+                    texture,
+                    rect: [
+                        p.at.0 as f32 * sx,
+                        p.at.1 as f32 * sy,
+                        *w as f32 * sx,
+                        *h as f32 * sy,
+                    ],
+                    opaque: *opaque,
+                })
+            })
+            .collect();
+        let compositor = self
+            .compositor
+            .get_or_insert_with(|| Compositor::new(&self.device));
+        compositor.draw(&self.device, &self.queue, &target, &quads);
+        self.committed(slot);
+    }
+
+    /// The tenant or popup at the root of `surface`'s subsurface tree, if
+    /// this crate hosts one.
+    fn root_slot_of(&self, surface: &WlSurface) -> Option<Slot> {
+        self.slot_of_surface(&root_of(surface))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Compositor, shm, dma-buf
 // ---------------------------------------------------------------------------
 
@@ -881,25 +1243,41 @@ impl CompositorHandler for State {
         &client.get_data::<ClientState>().unwrap().compositor_state
     }
 
+    fn new_subsurface(&mut self, surface: &WlSurface, parent: &WlSurface) {
+        // What a toplevel is told, a subsurface is told too: it is drawn at
+        // its tree's scale, on the one output there is.
+        self.output.enter(surface);
+        let scale = match self.slot_of_surface(&root_of(parent)) {
+            Some(Slot::Tenant(i)) => self.tenants[i].scale,
+            Some(Slot::Popup(i)) => self
+                .index_of(self.popups[i].root)
+                .map_or(1.0, |t| self.tenants[t].scale),
+            None => 1.0,
+        };
+        ask_scale(surface, scale);
+    }
+
     fn commit(&mut self, surface: &WlSurface) {
-        let (buffer, callbacks, shape) = with_states(surface, |states| {
+        let (buffer, callbacks, shape, role) = with_states(surface, |states| {
             let mut guard = states.cached_state.get::<SurfaceAttributes>();
             let attrs = guard.current();
+            // `Some(None)` is a null buffer attached, which unmaps the
+            // surface; `None` is no buffer ever.
             let buffer = match &attrs.buffer {
-                Some(BufferAssignment::NewBuffer(b)) => Some(b.clone()),
-                _ => None,
+                Some(BufferAssignment::NewBuffer(b)) => Some(Some(b.clone())),
+                Some(BufferAssignment::Removed) => Some(None),
+                None => None,
             };
             let callbacks = std::mem::take(&mut attrs.frame_callbacks);
             drop(guard);
-            (buffer, callbacks, Shape::of(states))
+            (buffer, callbacks, Shape::of(states), states.role)
         });
 
         let slot = self.slot_of_surface(surface);
-        let owner = match slot {
-            Some(Slot::Tenant(index)) => Some(self.tenants[index].id),
-            Some(Slot::Popup(index)) => Some(self.popups[index].root),
-            None => None,
-        };
+        let subsurface = slot.is_none() && role == Some(SUBSURFACE);
+        // A subsurface's callbacks pace the tenant whose tree it is in.
+        let paced_by = if subsurface { self.root_slot_of(surface) } else { slot };
+        let owner = paced_by.map(|slot| self.owner_of(slot));
         match slot {
             Some(Slot::Tenant(index)) => {
                 self.refresh_identity(index);
@@ -910,9 +1288,7 @@ impl CompositorHandler for State {
                 if !toplevel.is_initial_configure_sent() {
                     toplevel.send_configure();
                 }
-                if let Some(buffer) = buffer {
-                    self.absorb_buffer(Slot::Tenant(index), &buffer, shape);
-                }
+                self.absorb_root(Slot::Tenant(index), surface, buffer, shape);
             }
             Some(Slot::Popup(index)) => {
                 // Same rule, same reason: a popup that attaches before it has
@@ -927,9 +1303,13 @@ impl CompositorHandler for State {
                 // shadow margin, for a client that draws one. Re-read it here
                 // and move the popup if it moved.
                 self.refresh_popup_position(index);
-                if let Some(buffer) = buffer {
-                    self.absorb_buffer(Slot::Popup(index), &buffer, shape);
-                }
+                self.absorb_root(Slot::Popup(index), surface, buffer, shape);
+            }
+            // A desync subsurface's own commit, or a sync one's applied with
+            // its parent's: either way its tree is drawn again.
+            None if subsurface => {
+                let root = self.root_slot_of(surface);
+                self.absorb_layer(surface, root, buffer, shape);
             }
             None => {}
         }
@@ -1450,5 +1830,23 @@ mod tests {
     fn an_unpainted_tenant_constrains_nothing() {
         let p = menu(100, 760, 160, 120);
         assert_eq!(place_in(&p, (0, 0), (0, 0)), p.get_geometry());
+    }
+
+    /// Waydroid's root is a 1x1 buffer stretched over the window: the
+    /// composite is the window's size, not the buffer's.
+    #[test]
+    fn a_token_root_composites_at_its_logical_size() {
+        assert_eq!(super::composite_size((1, 1), (1280, 800), 1.0), (1280, 800));
+        assert_eq!(super::composite_size((1, 1), (1280, 800), 1.5), (1920, 1200));
+    }
+
+    /// A root that draws denser than it was asked keeps every pixel it drew;
+    /// one asked for more than it drew is drawn up to what was asked, so its
+    /// subsurfaces are not held to its resolution.
+    #[test]
+    fn a_composite_is_the_denser_of_buffer_and_scale() {
+        assert_eq!(super::composite_size((512, 512), (256, 256), 1.0), (512, 512));
+        assert_eq!(super::composite_size((256, 256), (256, 256), 2.0), (512, 512));
+        assert_eq!(super::composite_size((300, 100), (200, 200), 1.0), (300, 200));
     }
 }

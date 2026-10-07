@@ -5,6 +5,7 @@
 //! ```text
 //!   socket ─ wl_compositor + xdg_shell + zwp_linux_dmabuf_v1 + wl_shm
 //!          └─ commit ─ import-once ─ blit ─▶ Tenant::texture   (your wgpu::Device)
+//!                       └─ subsurfaces? ─ composite ─┘
 //!   tick() ───────────────────────────────▶ wl_callback.done ─ client paints again
 //!   pointer_motion / keyboard_key ────────▶ wl_pointer / wl_keyboard
 //! ```
@@ -39,6 +40,11 @@
 //! buffer size changes (a new size, or a new scale), which is announced as [`Event::Resized`] before any
 //! [`Event::Committed`] against the new handle. Index tenants by [`TenantId`],
 //! sample their textures, and never rebind per frame.
+//!
+//! A client that draws into `wl_subsurface`s — Wine's menus, Waydroid's whole
+//! picture — still has one texture: its surface tree drawn together, on your
+//! device, clipped to the toplevel's (or popup's) own rectangle. A client
+//! without subsurfaces never pays for that.
 //!
 //! # Coordinates
 //!
@@ -90,6 +96,7 @@
 #![doc(html_root_url = "https://docs.rs/glasspane/0.1.0")]
 
 pub mod acquire;
+mod compose;
 mod convert;
 mod error;
 pub mod event;
@@ -411,6 +418,8 @@ impl Glasspane {
             pointer_focus: None,
             ticks: 0,
             callbacks_sent: 0,
+            compositor: None,
+            dirty_trees: Vec::new(),
         };
 
         Ok(Self {
@@ -468,6 +477,9 @@ impl Glasspane {
         // popup list is swept here rather than waiting for a request that is
         // not coming.
         self.state.prune_popups();
+        // Trees whose surfaces committed in this turn are drawn once, now,
+        // with every surface's state of this turn applied.
+        self.state.compose_trees();
         self.state.flush();
         Ok(())
     }
@@ -608,8 +620,8 @@ impl Glasspane {
     /// the client draws a buffer of that size and says its logical size
     /// through `wp_viewporter`), and `wl_surface.preferred_buffer_scale` (the
     /// scale rounded *up* to an integer, for a client with only that — a
-    /// sharper buffer than asked beats a blurrier one). The tenant's popups,
-    /// open now or opened later, are asked the same.
+    /// sharper buffer than asked beats a blurrier one). The tenant's popups and
+    /// subsurfaces, open now or opened later, are asked the same.
     ///
     /// Like [`Glasspane::configure`] this is a request: the client repaints
     /// when it next paints, and a client that speaks neither protocol keeps
@@ -629,6 +641,10 @@ impl Glasspane {
                 .filter(|p| p.root == id)
                 .map(|p| p.surface.clone()),
         );
+        // And every subsurface of each: Wine draws its menus and GL areas
+        // in them, and they must draw at the scale their tree is drawn at.
+        let subsurfaces: Vec<_> = surfaces.iter().flat_map(state::subsurfaces_of).collect();
+        surfaces.extend(subsurfaces);
         for surface in &surfaces {
             state::ask_scale(surface, scale);
         }
