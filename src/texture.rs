@@ -17,9 +17,10 @@ use wgpu_dmabuf::format::Fourcc;
 
 /// The format every tenant texture has.
 ///
-/// `Bgra8Unorm` is the wgpu spelling of `ARGB8888`/`XRGB8888`, which are the
-/// only two formats this crate advertises. One format for every tenant means
-/// the shell can write one shader and one bind group layout.
+/// `Bgra8Unorm` is the wgpu spelling of `ARGB8888`/`XRGB8888`. A client
+/// committing in the other byte order (`ABGR8888`/`XBGR8888`) is drawn into a
+/// texture of this format all the same (see [`Reorder`]). One format for every
+/// tenant means the shell can write one shader and one bind group layout.
 ///
 /// Note that `XRGB8888` maps here too: there is no ignore-the-alpha `UNORM`
 /// format in Vulkan, so an `XRGB8888` client's alpha byte *is* sampled. A
@@ -46,12 +47,25 @@ pub const IMPORT_USAGE: wgpu::TextureUsages =
 
 /// The `wl_shm`/DRM formats this crate accepts, in advertisement order.
 ///
-/// Deliberately two. Every other fourcc either maps to a different
-/// `wgpu::TextureFormat` — which would make `Tenant::texture` a different type
-/// per tenant — or is multi-planar, which [`wgpu_dmabuf`] does not import. A
-/// client asking for anything else is refused at `wl_buffer` creation, where
-/// it can still choose differently, rather than at commit.
-pub const ACCEPTED_FOURCC: [Fourcc; 2] = [Fourcc::Argb8888, Fourcc::Xrgb8888];
+/// The 8888 formats in both byte orders, and no others. `ARGB8888` and
+/// `XRGB8888` import as [`TENANT_FORMAT`] and are copied. `ABGR8888` and
+/// `XBGR8888` import as `Rgba8Unorm` and are drawn across by [`Reorder`]:
+/// Android's gralloc allocates nothing else for RGBA, and Waydroid's
+/// hwcomposer passes gralloc's format through rather than picking from those
+/// advertised, so a compositor without them is a fatal `invalid_format` on
+/// Android's first frame. Every other fourcc is multi-planar, which
+/// [`wgpu_dmabuf`] does not import, or another bit depth. A client asking for
+/// anything else is refused at `wl_buffer` creation, where it can still choose
+/// differently, rather than at commit.
+///
+/// `wl_shm` stays on the first two: smithay offers only those, and every shm
+/// client this crate has met takes them.
+pub const ACCEPTED_FOURCC: [Fourcc; 4] = [
+    Fourcc::Argb8888,
+    Fourcc::Xrgb8888,
+    Fourcc::Abgr8888,
+    Fourcc::Xbgr8888,
+];
 
 /// A tenant's or a popup's stable texture. `label` is what it is called in a
 /// GPU capture — `tenant#3`, `popup#7`.
@@ -152,6 +166,170 @@ pub(crate) fn blit(
         },
     );
     queue.submit([encoder.finish()]);
+}
+
+/// Draws an imported image whose format is not [`TENANT_FORMAT`] into a
+/// tenant texture, for the clients [`blit`] cannot serve.
+///
+/// `copy_texture_to_texture` needs both formats to match, and `Rgba8Unorm`
+/// and `Bgra8Unorm` do not. A draw does not care: the fragment shader loads
+/// texels as `(r, g, b, a)` whatever their order in memory, and the target
+/// stores them in its own. One full-screen triangle, one `textureLoad` per
+/// pixel, no sampler and so no filtering: byte for byte, as the copy is.
+///
+/// Built on the first commit that needs it, so a shell with no such client
+/// never compiles the shader.
+pub(crate) struct Reorder {
+    pipeline: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
+}
+
+const REORDER_WGSL: &str = r"
+struct Crop { origin: vec2<u32> }
+
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var<uniform> crop: Crop;
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let uv = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
+}
+
+@fragment
+fn fs(@builtin(position) at: vec4<f32>) -> @location(0) vec4<f32> {
+    return textureLoad(src, vec2<u32>(at.xy) + crop.origin, 0);
+}
+";
+
+impl Reorder {
+    pub(crate) fn new(device: &wgpu::Device) -> Self {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("glasspane reorder"),
+            source: wgpu::ShaderSource::Wgsl(REORDER_WGSL.into()),
+        });
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("glasspane reorder"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("glasspane reorder"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("glasspane reorder"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: TENANT_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        Self { pipeline, layout }
+    }
+
+    /// [`blit`]'s contract, drawn rather than copied: the `crop` rectangle
+    /// of `src` into `dst` at its origin, in one submit. `dst` is the crop's
+    /// size (`ensure_texture` made it so), so the triangle covers all of it.
+    pub(crate) fn draw(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        src: &wgpu::Texture,
+        dst: &wgpu::Texture,
+        crop: (u32, u32, u32, u32),
+    ) {
+        use wgpu::util::DeviceExt as _;
+        let (x, y, _, _) = crop;
+        // A vec2<u32>, padded to the 16 bytes a uniform binding is sized in.
+        let mut origin = [0u8; 16];
+        origin[..4].copy_from_slice(&x.to_ne_bytes());
+        origin[4..8].copy_from_slice(&y.to_ne_bytes());
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("glasspane reorder crop"),
+            contents: &origin,
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let src_view = src.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("glasspane reorder"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&src_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("glasspane tenant reorder"),
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("glasspane tenant reorder"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &dst_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        queue.submit([encoder.finish()]);
+    }
 }
 
 /// The fields every surface this crate hands to the shell has: its size, its

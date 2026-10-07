@@ -42,6 +42,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   callbacks count as its root tenant's. `tick` is `tick_where` picking all.
 - `Tenant::callbacks_sent`: the frame callbacks answered for a tenant and its
   popups.
+- `ABGR8888` and `XBGR8888` dma-bufs are accepted, and drawn into the
+  tenant's `Bgra8Unorm` texture by a one-triangle pass rather than copied, so
+  the texture format stays one for every tenant. Android's gralloc allocates
+  nothing else, and Waydroid's hwcomposer was disconnected with
+  `invalid_format` on its first frame, over and over. `wl_shm` is unchanged.
 
 ### Changed
 

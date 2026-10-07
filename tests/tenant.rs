@@ -281,6 +281,34 @@ fn a_dmabuf_tenant_texture_is_byte_exact() {
     eprintln!("{report}");
 }
 
+/// **The other byte order, byte for byte.** An `ABGR8888` dma-buf, which is
+/// what Android commits, lands in the tenant texture as the same lattice an
+/// `ARGB8888` one does: drawn across rather than copied, and not
+/// channel-swapped on the way.
+#[test]
+fn an_abgr_dmabuf_tenant_texture_is_byte_exact() {
+    let Some((adapter, device, queue)) = gpu() else {
+        return;
+    };
+    let mut pane = start("dmabuf-abgr", Some(&adapter), device, queue);
+    if !pane.advertises_dmabuf() {
+        eprintln!("SKIP: this adapter shares no single-plane 8888 modifiers");
+        return;
+    }
+    let mut events = Vec::new();
+    let (_client, id) = map_tenant(&mut pane, Transport::DmabufAbgr, &mut events);
+
+    let tenant = pane.tenant(id).unwrap();
+    assert_eq!(tenant.texture().unwrap().format(), glasspane::texture::TENANT_FORMAT);
+    let (w, h) = tenant.size();
+    let got = read_back(&pane, id);
+    assert_eq!(
+        first_difference(&got, &fixture::expected(w, h), w),
+        None,
+        "the ABGR8888 dma-buf did not land as the lattice the client filled"
+    );
+}
+
 /// **The texture handle is stable while the size is.**
 ///
 /// Ten commits of a client that never resizes must land in one texture. A

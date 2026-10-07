@@ -397,6 +397,7 @@ impl Glasspane {
             output,
             registry: registry::Registry::new(),
             acquire,
+            reorder: None,
             tenants: Vec::new(),
             next_tenant: 0,
             popups: Vec::new(),

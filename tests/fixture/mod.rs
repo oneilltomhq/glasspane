@@ -29,6 +29,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::Duration;
 
+use wgpu_dmabuf::format::Fourcc;
+
 use wayland_client::protocol::{
     wl_buffer::WlBuffer, wl_callback, wl_compositor::WlCompositor, wl_keyboard, wl_pointer,
     wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
@@ -51,6 +53,9 @@ pub enum Transport {
     /// `zwp_linux_dmabuf_v1`: one GBM `LINEAR` buffer object, filled on the
     /// CPU and committed.
     Dmabuf,
+    /// The same, in `ABGR8888`: the lattice with its bytes in the other
+    /// order, as Android's gralloc commits.
+    DmabufAbgr,
 }
 
 /// What the fixture tells the test.
@@ -274,7 +279,7 @@ fn run(
     queue
         .roundtrip(&mut client)
         .map_err(|e| format!("registry roundtrip: {e}"))?;
-    if transport == Transport::Dmabuf && client.dmabuf.is_none() {
+    if transport != Transport::Shm && client.dmabuf.is_none() {
         return Err("the compositor advertised no zwp_linux_dmabuf_v1".into());
     }
     client.make_toplevel()?;
@@ -337,7 +342,8 @@ impl Client {
         }
         let ok = match self.transport {
             Transport::Shm => self.paint_shm(w, h),
-            Transport::Dmabuf => self.paint_dmabuf(w, h),
+            Transport::Dmabuf => self.paint_dmabuf(w, h, Fourcc::Argb8888),
+            Transport::DmabufAbgr => self.paint_dmabuf(w, h, Fourcc::Abgr8888),
         };
         if let Err(why) = ok {
             let _ = self.tx.send(Report::Failed(why));
@@ -407,7 +413,7 @@ impl Client {
         Ok(())
     }
 
-    fn paint_dmabuf(&mut self, w: u32, h: u32) -> Result<(), String> {
+    fn paint_dmabuf(&mut self, w: u32, h: u32, fourcc: Fourcc) -> Result<(), String> {
         if self.gbm.is_some() && self.buffer.is_some() && self.buffer_size == (w, h) {
             // A dma-buf's pixels are the client's own memory: re-committing
             // the same buffer is the whole point of the import-once law, and
@@ -417,8 +423,12 @@ impl Client {
         let allocator = wgpu_dmabuf::testkit::GbmAllocator::open_default()
             .ok_or("no DRM render node to allocate a dma-buf on")?;
         let bo = allocator
-            .allocate_linear(w, h, wgpu_dmabuf::format::Fourcc::Argb8888, |x, y| {
-                pattern(x, y)
+            .allocate_linear(w, h, fourcc, |x, y| {
+                let [b, g, r, a] = pattern(x, y);
+                match fourcc {
+                    Fourcc::Abgr8888 => [r, g, b, a],
+                    _ => [b, g, r, a],
+                }
             })
             .map_err(|e| format!("gbm allocate: {e}"))?;
         let plane = bo.dmabuf.sole_plane().map_err(|e| format!("plane: {e}"))?;
@@ -436,7 +446,7 @@ impl Client {
         let buffer = params.create_immed(
             w as i32,
             h as i32,
-            wgpu_dmabuf::format::Fourcc::Argb8888 as u32,
+            fourcc as u32,
             zwp_linux_buffer_params_v1::Flags::empty(),
             &self.qh,
             (),
