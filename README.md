@@ -193,6 +193,12 @@ in one and paste in another, or select in one and middle-click in another. The
 selection follows keyboard focus, so a tenant is offered it once it has the
 keyboard.
 
+A shell that is itself a Wayland window can hand glasspane its `wl_display`
+with `Glasspane::bridge_clipboard`, and the clipboard then crosses to and from
+the desktop: copy in a desktop app and paste in a tenant, or the other way.
+It rides the window's own connection, so the desktop treats it as the window
+copying and pasting, and it works only while the window has the keyboard.
+
 Not yet: subsurfaces, damage tracking
 (an shm commit uploads the whole buffer), multi-plane formats, drag-and-drop
 beyond the plumbing to accept it, `wp_viewport`, fractional scale, and KMS

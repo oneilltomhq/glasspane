@@ -199,6 +199,11 @@ pub enum Report {
     CloseRequested,
     /// The client could not start. The string is why.
     Failed(String),
+    /// The client's `wl_display`, as an address, sent once on connecting:
+    /// what a window hands `Glasspane::bridge_clipboard`, so a test can be
+    /// the window on a second glasspane standing in for the desktop. Live
+    /// for as long as the fixture is.
+    Display(usize),
 }
 
 /// The lattice the fixture paints, in **memory order** for `ARGB8888`, i.e.
@@ -389,6 +394,7 @@ fn run(
     let stream =
         UnixStream::connect(&path).map_err(|e| format!("connect {}: {e}", path.display()))?;
     let conn = Connection::from_socket(stream).map_err(|e| format!("wayland connection: {e}"))?;
+    let _ = tx.send(Report::Display(conn.backend().display_ptr() as usize));
     let display = conn.display();
     let mut queue = conn.new_event_queue();
     let qh = queue.handle();

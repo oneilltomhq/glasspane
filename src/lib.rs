@@ -96,6 +96,7 @@
 #![doc(html_root_url = "https://docs.rs/glasspane/0.1.0")]
 
 pub mod acquire;
+mod clipboard;
 mod compose;
 mod convert;
 mod error;
@@ -434,6 +435,7 @@ impl Glasspane {
             dmabuf_global,
             data_device_state,
             primary_selection_state,
+            clipboard: None,
             seat_state,
             seat,
             keyboard,
@@ -531,7 +533,43 @@ impl Glasspane {
         // Trees whose surfaces committed in this turn are drawn once, now,
         // with every surface's state of this turn applied.
         self.state.compose_trees();
+        self.state.pump_clipboard();
         self.state.flush();
+        Ok(())
+    }
+
+    /// **Share the desktop's clipboard with the tenants**, both ways, for a
+    /// shell that is a window on a Wayland desktop.
+    ///
+    /// `display` is the `wl_display` of the window's own connection: with
+    /// winit, the `RawDisplayHandle::Wayland` of the event loop's display
+    /// handle. From then on what the desktop's clipboard holds is offered to
+    /// the tenant with the keyboard, and what a tenant copies is offered on
+    /// the desktop, carried on through [`Glasspane::dispatch`]. The contents
+    /// are never read here: a paste is a pipe from whoever copied straight to
+    /// whoever pastes.
+    ///
+    /// It has to be the window's connection. A desktop offers its clipboard
+    /// only to the client with its keyboard, so the desktop's copy reaches the
+    /// tenants when the window gains focus, and a tenant's copy reaches the
+    /// desktop only while the window has it. Only the clipboard: the primary
+    /// selection stays between tenants. A shell with no window does not call
+    /// this, and nothing about the tenants' own clipboard changes. A second
+    /// call replaces the first.
+    ///
+    /// # Safety
+    ///
+    /// `display` must be a live `wl_display`, and stay live for as long as
+    /// this `Glasspane` does: drop the `Glasspane` before the connection
+    /// closes (with winit, before the event loop).
+    pub unsafe fn bridge_clipboard(
+        &mut self,
+        display: std::ptr::NonNull<std::ffi::c_void>,
+    ) -> Result<()> {
+        self.state.clipboard = None;
+        // SAFETY: the caller's.
+        let bridge = unsafe { clipboard::Bridge::new(display) }.map_err(Error::Clipboard)?;
+        self.state.clipboard = Some(bridge);
         Ok(())
     }
 
