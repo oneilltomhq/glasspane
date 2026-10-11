@@ -89,6 +89,10 @@ impl Tenant {
     /// The size of the last committed buffer in pixels, cropped to its
     /// viewport's source if it sets one: the texture's size. `(0, 0)` before
     /// the first commit.
+    ///
+    /// For a surface with subsurfaces the texture is the whole tree drawn
+    /// together, and this is that picture's size: the logical size at the
+    /// denser of the surface's own buffer and the scale it was asked for.
     pub fn buffer_size(&self) -> (u32, u32) {
         self.skin.buffer
     }

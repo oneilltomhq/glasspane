@@ -33,12 +33,14 @@ use wgpu_dmabuf::format::Fourcc;
 
 use wayland_client::protocol::{
     wl_buffer::WlBuffer, wl_callback, wl_compositor::WlCompositor, wl_keyboard, wl_pointer,
-    wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
+    wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_subcompositor::WlSubcompositor,
+    wl_subsurface::WlSubsurface, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, delegate_noop};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1,
 };
+use wayland_protocols::wp::viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter};
 use wayland_protocols::xdg::shell::client::{
     xdg_surface::{self, XdgSurface},
     xdg_toplevel::{self, XdgToplevel},
@@ -58,6 +60,69 @@ pub enum Transport {
     DmabufAbgr,
 }
 
+/// What the fixture's window is made of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    /// One surface, repainted on every frame callback.
+    Alone,
+    /// The toplevel painted with [`pattern`] once and never again, and a
+    /// desync `wl_subsurface` above it at [`sub_at`] — the way Wine draws a
+    /// menu. The subsurface paints phase 0 of [`sub_pattern`] and then, on
+    /// its own frame callback, phase 1; so a texture showing phase 1 over the
+    /// parent's lattice is a desync commit redrawn over pixels the parent
+    /// committed once.
+    Subsurface,
+    /// Waydroid's window: a 1x1 black `XRGB8888` toplevel stretched to the
+    /// configured size by a `wp_viewport`, and the same subsurface as
+    /// [`Layout::Subsurface`] on top, placed to hang past the bottom-right
+    /// corner.
+    Stretched,
+}
+
+/// The subsurface's size, in buffer and logical pixels alike.
+pub const SUB_SIZE: (u32, u32) = (64, 48);
+
+/// Where the subsurface sits on its parent.
+pub fn sub_at(layout: Layout) -> (i32, i32) {
+    match layout {
+        Layout::Stretched => (216, 220),
+        _ => (40, 24),
+    }
+}
+
+/// The subsurface's pixels, `XRGB8888` in memory order, its padding byte left
+/// at zero as a client is entitled to: a compositor that blended by it would
+/// draw nothing. Different in every channel from [`pattern`] and between
+/// phases.
+pub fn sub_pattern(x: u32, y: u32, phase: u32) -> [u8; 4] {
+    let b = (x * 17 + phase * 101 + 5) as u8;
+    let g = (y * 23 + 50) as u8;
+    let r = 200 - (phase * 80) as u8;
+    [b, g, r, 0]
+}
+
+/// The whole tree as the texture should show it, `width` by `height`, once
+/// the subsurface has painted `phase`.
+pub fn expected_tree(layout: Layout, width: u32, height: u32, phase: u32) -> Vec<u8> {
+    let (sx, sy) = sub_at(layout);
+    let mut out = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let (dx, dy) = (x as i32 - sx, y as i32 - sy);
+            let px = if (0..SUB_SIZE.0 as i32).contains(&dx) && (0..SUB_SIZE.1 as i32).contains(&dy) {
+                let [b, g, r, _] = sub_pattern(dx as u32, dy as u32, phase);
+                [b, g, r, 255]
+            } else if layout == Layout::Stretched {
+                [0, 0, 0, 255]
+            } else {
+                pattern(x, y)
+            };
+            out.extend_from_slice(&px);
+        }
+    }
+    out
+}
+
 /// What the fixture tells the test.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Report {
@@ -66,6 +131,9 @@ pub enum Report {
     Configured(i32, i32),
     /// A commit went out, carrying a buffer of this size. `n` counts them.
     Committed { n: u64, w: u32, h: u32 },
+    /// The subsurface committed, painted with this phase of
+    /// [`sub_pattern`]. `n` counts its commits.
+    SubCommitted { n: u64, phase: u32 },
     /// `wl_pointer.enter`, in **surface-local** coordinates.
     PointerEnter(f64, f64),
     /// `wl_pointer.motion`.
@@ -125,12 +193,17 @@ impl Fixture {
     /// the environment is process-wide, and two tests running in parallel that
     /// both set it are two tests that can hand a client the wrong compositor.
     pub fn start(socket_name: &std::ffi::OsStr, transport: Transport) -> Self {
+        Self::start_with(socket_name, transport, Layout::Alone)
+    }
+
+    /// [`Fixture::start`], with a window made of more than one surface.
+    pub fn start_with(socket_name: &std::ffi::OsStr, transport: Transport, layout: Layout) -> Self {
         let path = socket_path(socket_name);
         let (tx, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
         let handle = std::thread::spawn(move || {
-            if let Err(why) = run(path, transport, tx.clone(), &flag) {
+            if let Err(why) = run(path, transport, layout, tx.clone(), &flag) {
                 let _ = tx.send(Report::Failed(why));
             }
         });
@@ -194,6 +267,7 @@ fn socket_path(socket_name: &std::ffi::OsStr) -> PathBuf {
 struct Client {
     tx: Sender<Report>,
     transport: Transport,
+    layout: Layout,
     qh: QueueHandle<Client>,
 
     compositor: Option<WlCompositor>,
@@ -201,6 +275,8 @@ struct Client {
     dmabuf: Option<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1>,
     wm_base: Option<XdgWmBase>,
     seat: Option<wl_seat::WlSeat>,
+    subcompositor: Option<WlSubcompositor>,
+    viewporter: Option<WpViewporter>,
 
     surface: Option<wl_surface::WlSurface>,
     xdg_surface: Option<XdgSurface>,
@@ -221,7 +297,20 @@ struct Client {
     commits: u64,
     configured: bool,
     running: bool,
+
+    /// The subsurface and what it holds, for a [`Layout`] that has one. Its
+    /// pool and buffer are its own: the parent's must stay as committed.
+    sub: Option<(wl_surface::WlSurface, WlSubsurface)>,
+    sub_buffer: Option<(WlBuffer, ShmPool)>,
+    /// Kept alive: destroying it would drop the stretch.
+    viewport: Option<WpViewport>,
+    root_buffer: Option<(WlBuffer, ShmPool)>,
+    sub_commits: u64,
 }
+
+/// The user data of the subsurface's frame callback, to tell it from the
+/// toplevel's.
+struct SubFrame;
 
 struct ShmPool {
     pool: wl_shm_pool::WlShmPool,
@@ -240,6 +329,7 @@ impl Drop for ShmPool {
 fn run(
     path: PathBuf,
     transport: Transport,
+    layout: Layout,
     tx: Sender<Report>,
     stop: &AtomicBool,
 ) -> Result<(), String> {
@@ -254,12 +344,15 @@ fn run(
     let mut client = Client {
         tx,
         transport,
+        layout,
         qh: qh.clone(),
         compositor: None,
         shm: None,
         dmabuf: None,
         wm_base: None,
         seat: None,
+        subcompositor: None,
+        viewporter: None,
         surface: None,
         xdg_surface: None,
         toplevel: None,
@@ -271,6 +364,11 @@ fn run(
         commits: 0,
         configured: false,
         running: true,
+        sub: None,
+        sub_buffer: None,
+        viewport: None,
+        root_buffer: None,
+        sub_commits: 0,
     };
 
     // Two roundtrips: the first delivers the globals, the second the
@@ -338,6 +436,13 @@ impl Client {
     fn paint(&mut self) {
         let (w, h) = self.size;
         if w == 0 || h == 0 {
+            return;
+        }
+        if self.layout != Layout::Alone {
+            if let Err(why) = self.paint_tree(w, h) {
+                let _ = self.tx.send(Report::Failed(why));
+                self.running = false;
+            }
             return;
         }
         let ok = match self.transport {
@@ -459,6 +564,137 @@ impl Client {
     }
 }
 
+impl Client {
+    /// The toplevel of a [`Layout`] with a subsurface, painted once — the
+    /// subsurface is created first, so the parent's commit is what applies
+    /// its position — and then the subsurface's first frame.
+    fn paint_tree(&mut self, w: u32, h: u32) -> Result<(), String> {
+        if self.commits > 0 {
+            // Never again: from here on only the subsurface draws, and the
+            // parent's pixels are whatever the compositor kept.
+            return Ok(());
+        }
+        let compositor = self.compositor.clone().ok_or("no wl_compositor")?;
+        let subcompositor = self.subcompositor.clone().ok_or("no wl_subcompositor")?;
+        let parent = self.surface.clone().expect("surface");
+        let sub_surface = compositor.create_surface(&self.qh, ());
+        let sub = subcompositor.get_subsurface(&sub_surface, &parent, &self.qh, ());
+        let (x, y) = sub_at(self.layout);
+        sub.set_position(x, y);
+        sub.place_above(&parent);
+        sub.set_desync();
+        self.sub = Some((sub_surface, sub));
+
+        let size = match self.layout {
+            Layout::Stretched => {
+                let viewporter = self.viewporter.clone().ok_or("no wp_viewporter")?;
+                let viewport = viewporter.get_viewport(&parent, &self.qh, ());
+                viewport.set_destination(w as i32, h as i32);
+                self.viewport = Some(viewport);
+                let root = self.shm_buffer(1, 1, wl_shm::Format::Xrgb8888, |_, _| [0, 0, 0, 0])?;
+                parent.attach(Some(&root.0), 0, 0);
+                parent.damage_buffer(0, 0, 1, 1);
+                self.root_buffer = Some(root);
+                (1, 1)
+            }
+            _ => {
+                match self.transport {
+                    Transport::Shm => self.paint_shm(w, h)?,
+                    Transport::Dmabuf => self.paint_dmabuf(w, h, Fourcc::Argb8888)?,
+                    Transport::DmabufAbgr => self.paint_dmabuf(w, h, Fourcc::Abgr8888)?,
+                }
+                parent.attach(self.buffer.as_ref(), 0, 0);
+                parent.damage_buffer(0, 0, w as i32, h as i32);
+                (w, h)
+            }
+        };
+        parent.commit();
+        self.commits += 1;
+        let _ = self.tx.send(Report::Committed {
+            n: self.commits,
+            w: size.0,
+            h: size.1,
+        });
+        self.paint_sub();
+        Ok(())
+    }
+
+    /// The subsurface's next frame: phase 0, then phase 1 on its first frame
+    /// callback, then nothing.
+    fn paint_sub(&mut self) {
+        if self.sub_commits >= 2 {
+            return;
+        }
+        let phase = self.sub_commits as u32;
+        let (w, h) = SUB_SIZE;
+        let buffer = match self.shm_buffer(w, h, wl_shm::Format::Xrgb8888, |x, y| sub_pattern(x, y, phase)) {
+            Ok(b) => b,
+            Err(why) => {
+                let _ = self.tx.send(Report::Failed(why));
+                self.running = false;
+                return;
+            }
+        };
+        let (surface, _) = self.sub.clone().expect("subsurface");
+        surface.attach(Some(&buffer.0), 0, 0);
+        surface.damage_buffer(0, 0, w as i32, h as i32);
+        surface.frame(&self.qh, SubFrame);
+        surface.commit();
+        if let Some((old, _pool)) = self.sub_buffer.replace(buffer) {
+            old.destroy();
+        }
+        self.sub_commits += 1;
+        let _ = self.tx.send(Report::SubCommitted {
+            n: self.sub_commits,
+            phase,
+        });
+    }
+
+    /// A fresh shm buffer of its own pool, filled by `fill`.
+    fn shm_buffer(
+        &self,
+        w: u32,
+        h: u32,
+        format: wl_shm::Format,
+        fill: impl Fn(u32, u32) -> [u8; 4],
+    ) -> Result<(WlBuffer, ShmPool), String> {
+        let stride = w * 4;
+        let len = (stride * h) as usize;
+        let fd = memfd(len)?;
+        // SAFETY: `fd` is a memfd of exactly `len` bytes, just created.
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        if map == libc::MAP_FAILED {
+            return Err(format!("mmap: {}", std::io::Error::last_os_error()));
+        }
+        let shm = self.shm.clone().ok_or("no wl_shm")?;
+        let pool = shm.create_pool(fd.as_fd(), len as i32, &self.qh, ());
+        let buffer = pool.create_buffer(0, w as i32, h as i32, stride as i32, format, &self.qh, ());
+        let pool = ShmPool {
+            pool,
+            map: map.cast(),
+            len,
+        };
+        // SAFETY: the mapping is `len` bytes, written row-major inside it.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(pool.map, len) };
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                bytes[i..i + 4].copy_from_slice(&fill(x, y));
+            }
+        }
+        Ok((buffer, pool))
+    }
+}
+
 fn memfd(len: usize) -> Result<OwnedFd, String> {
     // SAFETY: a NUL-terminated name and no flags that change ownership.
     let fd = unsafe { libc::memfd_create(c"glasspane-fixture".as_ptr(), libc::MFD_CLOEXEC) };
@@ -504,6 +740,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Client {
             }
             "xdg_wm_base" => {
                 state.wm_base = Some(registry.bind(name, version.min(3), qh, ()));
+            }
+            "wl_subcompositor" => {
+                state.subcompositor = Some(registry.bind(name, 1, qh, ()));
+            }
+            "wp_viewporter" => {
+                state.viewporter = Some(registry.bind(name, 1, qh, ()));
             }
             "wl_seat" => {
                 let seat: wl_seat::WlSeat = registry.bind(name, version.min(5), qh, ());
@@ -681,7 +923,26 @@ impl Dispatch<wl_callback::WlCallback, ()> for Client {
     }
 }
 
+impl Dispatch<wl_callback::WlCallback, SubFrame> for Client {
+    fn event(
+        state: &mut Self,
+        _: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        _: &SubFrame,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_callback::Event::Done { .. } = event {
+            state.paint_sub();
+        }
+    }
+}
+
 delegate_noop!(Client: ignore WlCompositor);
+delegate_noop!(Client: ignore WlSubcompositor);
+delegate_noop!(Client: ignore WlSubsurface);
+delegate_noop!(Client: ignore WpViewporter);
+delegate_noop!(Client: ignore WpViewport);
 delegate_noop!(Client: ignore wl_surface::WlSurface);
 delegate_noop!(Client: ignore wl_shm::WlShm);
 delegate_noop!(Client: ignore wl_shm_pool::WlShmPool);

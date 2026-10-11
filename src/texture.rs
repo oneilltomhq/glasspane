@@ -346,11 +346,18 @@ pub(crate) struct Skin {
     /// client drawing at scale 1.
     pub(crate) size: (u32, u32),
     /// The last committed buffer's size in pixels, cropped to its viewport's
-    /// source if it sets one: the texture's.
+    /// source if it sets one: the texture's. For a surface with subsurfaces,
+    /// the composite's (see [`crate::compose`]).
     /// Larger than [`Skin::size`] when the client draws at a scale above 1;
     /// `(0, 0)` before the first commit.
     pub(crate) buffer: (u32, u32),
     pub(crate) texture: Option<std::sync::Arc<wgpu::Texture>>,
     pub(crate) generation: u64,
     pub(crate) acquire_staged: bool,
+    /// `None` for a surface drawn alone, its buffer straight into
+    /// [`Skin::texture`]. For one with subsurfaces, whose texture is a
+    /// composite (see [`crate::compose`]), a hash of the tree's shape — which
+    /// surfaces, in what order, where — when it was last drawn, so a tree that
+    /// changes shape without a commit to say so is noticed and redrawn.
+    pub(crate) tree: Option<u64>,
 }
