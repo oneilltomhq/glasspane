@@ -56,11 +56,11 @@ use smithay::wayland::shell::xdg::{
 use smithay::wayland::shm::{ShmHandler, ShmState, with_buffer_contents};
 
 use crate::acquire::AcquireGate;
+use crate::compose::{Compositor, Quad};
 use crate::input::Target;
 use crate::popup::{Parent, Popup, PopupId};
 use crate::registry::{BufferKey, Registry};
 use crate::tenant::{Tenant, TenantId};
-use crate::compose::{Compositor, Quad};
 use crate::texture::Skin;
 use crate::{texture, Event};
 
@@ -144,8 +144,14 @@ impl Shape {
         };
         let s = f64::from(self.buffer_scale.max(1));
         let (bw, bh) = (f64::from(buffer.0), f64::from(buffer.1));
-        let (x0, y0) = ((x * s).round().clamp(0.0, bw), (y * s).round().clamp(0.0, bh));
-        let (x1, y1) = (((x + w) * s).round().clamp(0.0, bw), ((y + h) * s).round().clamp(0.0, bh));
+        let (x0, y0) = (
+            (x * s).round().clamp(0.0, bw),
+            (y * s).round().clamp(0.0, bh),
+        );
+        let (x1, y1) = (
+            ((x + w) * s).round().clamp(0.0, bw),
+            ((y + h) * s).round().clamp(0.0, bh),
+        );
         if x1 <= x0 || y1 <= y0 {
             return whole;
         }
@@ -168,7 +174,11 @@ impl Shape {
     pub(crate) fn frame(self, buffer: (u32, u32), window: Option<(i32, i32, i32, i32)>) -> Frame {
         let crop = self.crop(buffer);
         let logical = self.logical((crop.2, crop.3));
-        let whole = Frame { crop, logical, origin: (0, 0) };
+        let whole = Frame {
+            crop,
+            logical,
+            origin: (0, 0),
+        };
         let Some((x, y, w, h)) = window.and_then(|g| window_in(g, logical)) else {
             return whole;
         };
@@ -202,9 +212,7 @@ impl Shape {
             .size()
             .filter(|s| s.w > 0 && s.h > 0)
             .map(|s| (s.w as u32, s.h as u32));
-        let source = port
-            .src
-            .map(|r| (r.loc.x, r.loc.y, r.size.w, r.size.h));
+        let source = port.src.map(|r| (r.loc.x, r.loc.y, r.size.w, r.size.h));
         Shape {
             buffer_scale,
             viewport,
@@ -260,7 +268,12 @@ pub(crate) fn ask_scale(surface: &WlSurface, scale: f64) {
         with_fractional_scale(states, |fs| fs.set_preferred_scale(scale));
         // Up, not to nearest: an integer-only client asked for 1.5 that
         // draws 2 is downsampled a little; one that draws 1 is blurred.
-        send_surface_state(surface, states, scale.ceil().max(1.0) as i32, Transform::Normal);
+        send_surface_state(
+            surface,
+            states,
+            scale.ceil().max(1.0) as i32,
+            Transform::Normal,
+        );
     });
 }
 
@@ -489,7 +502,11 @@ impl State {
     /// then: a tenant it says yes to is one that got callbacks this tick.
     /// Callbacks of a surface that belongs to no live tenant are always
     /// answered; those of a client that has gone are dropped.
-    pub(crate) fn release_frame_callbacks(&mut self, now_ms: u32, mut due: impl FnMut(TenantId) -> bool) -> usize {
+    pub(crate) fn release_frame_callbacks(
+        &mut self,
+        now_ms: u32,
+        mut due: impl FnMut(TenantId) -> bool,
+    ) -> usize {
         self.ticks += 1;
         if self.pending_callbacks.is_empty() {
             return 0;
@@ -657,7 +674,12 @@ impl State {
     }
 
     /// Put a buffer's pixels at `dest`, by whichever path its memory needs.
-    fn absorb_into(&mut self, dest: Dest<'_>, buffer: &WlBuffer, shape: Shape) -> Result<(), String> {
+    fn absorb_into(
+        &mut self,
+        dest: Dest<'_>,
+        buffer: &WlBuffer,
+        shape: Shape,
+    ) -> Result<(), String> {
         match get_dmabuf(buffer) {
             Ok(dmabuf) => self.absorb_dmabuf(dest, buffer_key(buffer), &dmabuf.clone(), shape),
             Err(_) => self.absorb_shm(dest, buffer, shape),
@@ -755,7 +777,12 @@ impl State {
         Ok(())
     }
 
-    fn absorb_shm(&mut self, dest: Dest<'_>, buffer: &WlBuffer, shape: Shape) -> Result<(), String> {
+    fn absorb_shm(
+        &mut self,
+        dest: Dest<'_>,
+        buffer: &WlBuffer,
+        shape: Shape,
+    ) -> Result<(), String> {
         let read = with_buffer_contents(buffer, |ptr, len, data| {
             let opaque = match data.format {
                 wl_shm::Format::Argb8888 => false,
@@ -921,7 +948,11 @@ impl State {
         let mut out = Vec::new();
         let mut frontier = vec![id];
         while let Some(parent) = frontier.pop() {
-            for p in self.popups.iter().filter(|p| p.parent == Parent::Popup(parent)) {
+            for p in self
+                .popups
+                .iter()
+                .filter(|p| p.parent == Parent::Popup(parent))
+            {
                 out.push(p.id);
                 frontier.push(p.id);
             }
@@ -983,7 +1014,9 @@ impl State {
     fn release_grab(&mut self) {
         self.grab = None;
         let back = self.focus_before_grab.take();
-        let surface = back.and_then(|t| self.slot_of_target(t)).map(|slot| self.surface_of(slot));
+        let surface = back
+            .and_then(|t| self.slot_of_target(t))
+            .map(|slot| self.surface_of(slot));
         let serial = smithay::utils::SERIAL_COUNTER.next_serial();
         self.keyboard.clone().set_focus(self, surface, serial);
         self.keyboard_focus = back.filter(|t| self.slot_of_target(*t).is_some());
@@ -1082,7 +1115,9 @@ struct Layer {
 }
 
 fn layer_of(states: &SurfaceData) -> &Mutex<Layer> {
-    states.data_map.get_or_insert_threadsafe(Mutex::<Layer>::default)
+    states
+        .data_map
+        .get_or_insert_threadsafe(Mutex::<Layer>::default)
 }
 
 /// Where a surface of a tree is, given where its parent is: `None` for a
@@ -1091,7 +1126,11 @@ fn layer_of(states: &SurfaceData) -> &Mutex<Layer> {
 fn place_of(states: &SurfaceData, parent: Option<(i32, i32)>) -> Option<(i32, i32)> {
     let (x, y) = parent?;
     let mapped = matches!(
-        states.cached_state.get::<SurfaceAttributes>().current().buffer,
+        states
+            .cached_state
+            .get::<SurfaceAttributes>()
+            .current()
+            .buffer,
         Some(BufferAssignment::NewBuffer(_))
     );
     if !mapped {
@@ -1100,7 +1139,11 @@ fn place_of(states: &SurfaceData, parent: Option<(i32, i32)>) -> Option<(i32, i3
     if states.role != Some(SUBSURFACE) {
         return Some((x, y));
     }
-    let at = states.cached_state.get::<SubsurfaceCachedState>().current().location;
+    let at = states
+        .cached_state
+        .get::<SubsurfaceCachedState>()
+        .current()
+        .location;
     Some((x + at.x, y + at.y))
 }
 
@@ -1143,7 +1186,12 @@ fn walk(root: &WlSurface) -> (Vec<Piece>, u64) {
             let Some(at) = at else {
                 return;
             };
-            let buffer = match &states.cached_state.get::<SurfaceAttributes>().current().buffer {
+            let buffer = match &states
+                .cached_state
+                .get::<SurfaceAttributes>()
+                .current()
+                .buffer
+            {
                 Some(BufferAssignment::NewBuffer(b)) => Some(b.clone()),
                 _ => None,
             };
@@ -1200,12 +1248,20 @@ impl State {
     /// **A root with no subsurfaces takes the path it always has**: its
     /// buffer straight into its texture, no layer, no composite, no pipeline.
     /// What a subsurface costs is paid only by a client that makes one.
-    fn absorb_root(&mut self, slot: Slot, surface: &WlSurface, buffer: Option<Option<WlBuffer>>, shape: Shape) {
+    fn absorb_root(
+        &mut self,
+        slot: Slot,
+        surface: &WlSurface,
+        buffer: Option<Option<WlBuffer>>,
+        shape: Shape,
+    ) {
         if get_children(surface).is_empty() {
             if self.skin_mut(slot).tree.take().is_some() {
                 // It had a tree, and has drawn alone since: its layer is a
                 // copy nothing will read.
-                with_states(surface, |states| layer_of(states).lock().unwrap().texture = None);
+                with_states(surface, |states| {
+                    layer_of(states).lock().unwrap().texture = None
+                });
             }
             if let Some(Some(buffer)) = buffer {
                 self.absorb_buffer(slot, &buffer, shape);
@@ -1220,7 +1276,13 @@ impl State {
     /// A tree surface's commit: its buffer into its layer, a null buffer out
     /// of it, and the tree marked for drawing either way, since a commit may
     /// also have moved it.
-    fn absorb_layer(&mut self, surface: &WlSurface, root: Option<Slot>, buffer: Option<Option<WlBuffer>>, shape: Shape) {
+    fn absorb_layer(
+        &mut self,
+        surface: &WlSurface,
+        root: Option<Slot>,
+        buffer: Option<Option<WlBuffer>>,
+        shape: Shape,
+    ) {
         match buffer {
             Some(Some(buffer)) => {
                 if let Err(why) = self.absorb_into(Dest::Layer(surface, root), &buffer, shape) {
@@ -1228,7 +1290,9 @@ impl State {
                     self.reject(id, why);
                 }
             }
-            Some(None) => with_states(surface, |states| layer_of(states).lock().unwrap().texture = None),
+            Some(None) => with_states(surface, |states| {
+                layer_of(states).lock().unwrap().texture = None
+            }),
             None => {}
         }
         if let Some(slot) = root {
@@ -1292,7 +1356,11 @@ impl State {
             let Some(buffer) = piece.buffer.clone() else {
                 continue;
             };
-            match self.absorb_into(Dest::Layer(&piece.surface, Some(slot)), &buffer, piece.shape) {
+            match self.absorb_into(
+                Dest::Layer(&piece.surface, Some(slot)),
+                &buffer,
+                piece.shape,
+            ) {
                 Ok(()) => piece.layer = with_states(&piece.surface, layer_snapshot),
                 Err(why) => {
                     let id = self.owner_of(slot);
@@ -1323,16 +1391,31 @@ impl State {
         // alone (`Shape::frame`): the texture starts at its origin and is its
         // size, at the root layer's own density.
         let window = self.window(slot).and_then(|g| window_in(g, logical));
-        let (origin, shown) =
-            window.map_or(((0, 0), logical), |(x, y, w, h)| ((x as i32, y as i32), (w, h)));
+        let (origin, shown) = window.map_or(((0, 0), logical), |(x, y, w, h)| {
+            ((x as i32, y as i32), (w, h))
+        });
         let dense = |texels: u32, of: u32, part: u32| {
             (u64::from(texels) * u64::from(part) / u64::from(of)).max(1) as u32
         };
-        let base_texels = (dense(base.width(), logical.0, shown.0), dense(base.height(), logical.1, shown.1));
+        let base_texels = (
+            dense(base.width(), logical.0, shown.0),
+            dense(base.height(), logical.1, shown.1),
+        );
         let size = composite_size(base_texels, shown, scale);
         // The composite is all texels of its own.
-        self.ensure_texture(slot, Frame { crop: (0, 0, size.0, size.1), logical: shown, origin });
-        let target = self.skin(slot).texture.clone().expect("ensure_texture just set it");
+        self.ensure_texture(
+            slot,
+            Frame {
+                crop: (0, 0, size.0, size.1),
+                logical: shown,
+                origin,
+            },
+        );
+        let target = self
+            .skin(slot)
+            .texture
+            .clone()
+            .expect("ensure_texture just set it");
         let (sx, sy) = (
             size.0 as f32 / shown.0 as f32,
             size.1 as f32 / shown.1 as f32,
@@ -1413,7 +1496,11 @@ impl CompositorHandler for State {
         let slot = self.slot_of_surface(surface);
         let subsurface = slot.is_none() && role == Some(SUBSURFACE);
         // A subsurface's callbacks pace the tenant whose tree it is in.
-        let paced_by = if subsurface { self.root_slot_of(surface) } else { slot };
+        let paced_by = if subsurface {
+            self.root_slot_of(surface)
+        } else {
+            slot
+        };
         let owner = paced_by.map(|slot| self.owner_of(slot));
         match slot {
             Some(Slot::Tenant(index)) => {
@@ -1453,7 +1540,8 @@ impl CompositorHandler for State {
 
         // Harvested, not answered: [`State::release_frame_callbacks`] answers
         // them, on the caller's clock, filed under the tenant they pace.
-        self.pending_callbacks.extend(callbacks.into_iter().map(|cb| (owner, cb)));
+        self.pending_callbacks
+            .extend(callbacks.into_iter().map(|cb| (owner, cb)));
     }
 }
 
@@ -1587,7 +1675,10 @@ impl XdgShellHandler for State {
             return;
         };
         let Some((parent, root, base)) = self.parent_of(&parent_surface) else {
-            self.reject(None, "xdg_popup on a surface this compositor does not host".into());
+            self.reject(
+                None,
+                "xdg_popup on a surface this compositor does not host".into(),
+            );
             let _ = surface.send_configure();
             return;
         };
@@ -1813,7 +1904,11 @@ impl SeatHandler for State {
     /// glasspane draws nothing, so this is dropped. A shell that wants to
     /// honour a client cursor reads it from the seat itself; wrapping it here
     /// would be scene policy.
-    fn cursor_image(&mut self, _seat: &Seat<Self>, _image: smithay::input::pointer::CursorImageStatus) {
+    fn cursor_image(
+        &mut self,
+        _seat: &Seat<Self>,
+        _image: smithay::input::pointer::CursorImageStatus,
+    ) {
     }
 }
 
@@ -1886,34 +1981,63 @@ mod tests {
         assert_eq!(cropped.crop((1920, 1200)), (0, 0, 1434, 551));
         assert_eq!(cropped.logical((1434, 551)), (1434, 551));
         // In logical pixels: at buffer scale 2 it is twice as many texels.
-        let scaled = super::Shape { buffer_scale: 2, source: Some((10.0, 5.0, 100.0, 50.0)), ..cropped };
+        let scaled = super::Shape {
+            buffer_scale: 2,
+            source: Some((10.0, 5.0, 100.0, 50.0)),
+            ..cropped
+        };
         assert_eq!(scaled.crop((1920, 1200)), (20, 10, 200, 100));
         // Kept inside the buffer; a source wholly off it is no crop.
-        let over = super::Shape { source: Some((1800.0, 0.0, 400.0, 100.0)), ..cropped };
+        let over = super::Shape {
+            source: Some((1800.0, 0.0, 400.0, 100.0)),
+            ..cropped
+        };
         assert_eq!(over.crop((1920, 1200)), (1800, 0, 120, 100));
-        let off = super::Shape { source: Some((2000.0, 0.0, 10.0, 10.0)), ..cropped };
+        let off = super::Shape {
+            source: Some((2000.0, 0.0, 10.0, 10.0)),
+            ..cropped
+        };
         assert_eq!(off.crop((1920, 1200)), (0, 0, 1920, 1200));
-        let none = super::Shape { source: None, ..cropped };
+        let none = super::Shape {
+            source: None,
+            ..cropped
+        };
         assert_eq!(none.crop((1920, 1200)), (0, 0, 1920, 1200));
     }
 
     #[test]
     fn a_viewport_destination_is_the_logical_size() {
-        let shape = super::Shape { buffer_scale: 1, viewport: Some((390, 520)), source: None };
+        let shape = super::Shape {
+            buffer_scale: 1,
+            viewport: Some((390, 520)),
+            source: None,
+        };
         assert_eq!(shape.logical((819, 1092)), (390, 520));
     }
 
     #[test]
     fn without_a_viewport_the_buffer_is_divided_by_its_scale() {
-        let shape = super::Shape { buffer_scale: 2, viewport: None, source: None };
+        let shape = super::Shape {
+            buffer_scale: 2,
+            viewport: None,
+            source: None,
+        };
         assert_eq!(shape.logical((780, 1040)), (390, 520));
-        let shape = super::Shape { buffer_scale: 1, viewport: None, source: None };
+        let shape = super::Shape {
+            buffer_scale: 1,
+            viewport: None,
+            source: None,
+        };
         assert_eq!(shape.logical((390, 520)), (390, 520));
     }
 
     #[test]
     fn a_nonsense_buffer_scale_is_read_as_one() {
-        let shape = super::Shape { buffer_scale: 0, viewport: None, source: None };
+        let shape = super::Shape {
+            buffer_scale: 0,
+            viewport: None,
+            source: None,
+        };
         assert_eq!(shape.logical((390, 520)), (390, 520));
     }
 
@@ -1922,31 +2046,61 @@ mod tests {
     #[test]
     fn a_window_geometry_is_the_part_of_the_surface_drawn() {
         use super::Frame;
-        let plain = super::Shape { buffer_scale: 1, viewport: None, source: None };
+        let plain = super::Shape {
+            buffer_scale: 1,
+            viewport: None,
+            source: None,
+        };
         let window = Some((20, 20, 1280, 800));
         assert_eq!(
             plain.frame((1320, 840), window),
-            Frame { crop: (20, 20, 1280, 800), logical: (1280, 800), origin: (20, 20) }
+            Frame {
+                crop: (20, 20, 1280, 800),
+                logical: (1280, 800),
+                origin: (20, 20)
+            }
         );
         // At buffer scale 2 the margin is twice as many texels.
-        let scaled = super::Shape { buffer_scale: 2, ..plain };
+        let scaled = super::Shape {
+            buffer_scale: 2,
+            ..plain
+        };
         assert_eq!(
             scaled.frame((2640, 1680), window),
-            Frame { crop: (40, 40, 2560, 1600), logical: (1280, 800), origin: (20, 20) }
+            Frame {
+                crop: (40, 40, 2560, 1600),
+                logical: (1280, 800),
+                origin: (20, 20)
+            }
         );
         // A fractional client: 1.5x buffer, the viewport saying its logical size.
-        let fractional = super::Shape { viewport: Some((1320, 840)), ..plain };
+        let fractional = super::Shape {
+            viewport: Some((1320, 840)),
+            ..plain
+        };
         assert_eq!(
             fractional.frame((1980, 1260), window),
-            Frame { crop: (30, 30, 1920, 1200), logical: (1280, 800), origin: (20, 20) }
+            Frame {
+                crop: (30, 30, 1920, 1200),
+                logical: (1280, 800),
+                origin: (20, 20)
+            }
         );
         // Hanging off the top-left: the part inside the surface.
         assert_eq!(
             plain.frame((1320, 840), Some((-10, -10, 100, 100))),
-            Frame { crop: (0, 0, 90, 90), logical: (90, 90), origin: (0, 0) }
+            Frame {
+                crop: (0, 0, 90, 90),
+                logical: (90, 90),
+                origin: (0, 0)
+            }
         );
         // The whole surface, or none of it, is no cut.
-        let whole = Frame { crop: (0, 0, 1320, 840), logical: (1320, 840), origin: (0, 0) };
+        let whole = Frame {
+            crop: (0, 0, 1320, 840),
+            logical: (1320, 840),
+            origin: (0, 0),
+        };
         assert_eq!(plain.frame((1320, 840), Some((0, 0, 1320, 840))), whole);
         assert_eq!(plain.frame((1320, 840), Some((2000, 0, 10, 10))), whole);
         assert_eq!(plain.frame((1320, 840), None), whole);
@@ -2010,7 +2164,11 @@ mod tests {
         let flat = place_in(&p, (0, 0), (1280, 800));
         let inset = place_in(&p, (0, 40), (1280, 800));
         assert_ne!(flat, inset, "the base offset made no difference");
-        assert_eq!((flat.loc.x, flat.loc.y), (100, 671), "it should fit as it is");
+        assert_eq!(
+            (flat.loc.x, flat.loc.y),
+            (100, 671),
+            "it should fit as it is"
+        );
         assert!(
             inset.loc.y + inset.size.h <= 800 - 40,
             "constrained against the wrong rectangle: {inset:?}"
@@ -2031,7 +2189,10 @@ mod tests {
     #[test]
     fn a_token_root_composites_at_its_logical_size() {
         assert_eq!(super::composite_size((1, 1), (1280, 800), 1.0), (1280, 800));
-        assert_eq!(super::composite_size((1, 1), (1280, 800), 1.5), (1920, 1200));
+        assert_eq!(
+            super::composite_size((1, 1), (1280, 800), 1.5),
+            (1920, 1200)
+        );
     }
 
     /// A root that draws denser than it was asked keeps every pixel it drew;
@@ -2039,8 +2200,17 @@ mod tests {
     /// subsurfaces are not held to its resolution.
     #[test]
     fn a_composite_is_the_denser_of_buffer_and_scale() {
-        assert_eq!(super::composite_size((512, 512), (256, 256), 1.0), (512, 512));
-        assert_eq!(super::composite_size((256, 256), (256, 256), 2.0), (512, 512));
-        assert_eq!(super::composite_size((300, 100), (200, 200), 1.0), (300, 200));
+        assert_eq!(
+            super::composite_size((512, 512), (256, 256), 1.0),
+            (512, 512)
+        );
+        assert_eq!(
+            super::composite_size((256, 256), (256, 256), 2.0),
+            (512, 512)
+        );
+        assert_eq!(
+            super::composite_size((300, 100), (200, 200), 1.0),
+            (300, 200)
+        );
     }
 }

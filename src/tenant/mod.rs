@@ -10,7 +10,6 @@ pub mod browser;
 
 use std::sync::Arc;
 
-
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::shell::xdg::ToplevelSurface;
 

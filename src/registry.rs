@@ -153,5 +153,4 @@ mod tests {
         assert_eq!(reg.cache_hit_count(), 0);
         assert!(reg.is_empty());
     }
-
 }

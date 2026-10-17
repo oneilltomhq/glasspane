@@ -36,11 +36,13 @@ use wayland_client::protocol::{
     wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_subcompositor::WlSubcompositor,
     wl_subsurface::WlSubsurface, wl_surface,
 };
-use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, delegate_noop};
+use wayland_client::{delegate_noop, Connection, Dispatch, Proxy, QueueHandle};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1,
 };
-use wayland_protocols::wp::viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter};
+use wayland_protocols::wp::viewporter::client::{
+    wp_viewport::WpViewport, wp_viewporter::WpViewporter,
+};
 use wayland_protocols::xdg::shell::client::{
     xdg_surface::{self, XdgSurface},
     xdg_toplevel::{self, XdgToplevel},
@@ -151,7 +153,8 @@ pub fn expected_tree(layout: Layout, width: u32, height: u32, phase: u32) -> Vec
     for y in 0..height {
         for x in 0..width {
             let (dx, dy) = (x as i32 - sx, y as i32 - sy);
-            let px = if (0..SUB_SIZE.0 as i32).contains(&dx) && (0..SUB_SIZE.1 as i32).contains(&dy) {
+            let px = if (0..SUB_SIZE.0 as i32).contains(&dx) && (0..SUB_SIZE.1 as i32).contains(&dy)
+            {
                 let [b, g, r, _] = sub_pattern(dx as u32, dy as u32, phase);
                 [b, g, r, 255]
             } else if layout == Layout::Stretched {
@@ -264,7 +267,10 @@ impl Fixture {
         let mut seen = Vec::new();
         loop {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
-            match self.reports.recv_timeout(left.max(Duration::from_millis(1))) {
+            match self
+                .reports
+                .recv_timeout(left.max(Duration::from_millis(1)))
+            {
                 Ok(r) => {
                     if want(&r) {
                         return r;
@@ -377,8 +383,8 @@ fn run(
     tx: Sender<Report>,
     stop: &AtomicBool,
 ) -> Result<(), String> {
-    let stream = UnixStream::connect(&path)
-        .map_err(|e| format!("connect {}: {e}", path.display()))?;
+    let stream =
+        UnixStream::connect(&path).map_err(|e| format!("connect {}: {e}", path.display()))?;
     let conn = Connection::from_socket(stream).map_err(|e| format!("wayland connection: {e}"))?;
     let display = conn.display();
     let mut queue = conn.new_event_queue();
@@ -486,7 +492,10 @@ impl Client {
             self.reframe();
             return;
         }
-        if !matches!(self.layout, Layout::Alone | Layout::Shadowed | Layout::Reframed) {
+        if !matches!(
+            self.layout,
+            Layout::Alone | Layout::Shadowed | Layout::Reframed
+        ) {
             if let Err(why) = self.paint_tree(w, h) {
                 let _ = self.tx.send(Report::Failed(why));
                 self.running = false;
@@ -551,8 +560,9 @@ impl Client {
     fn paint_shm(&mut self, w: u32, h: u32) -> Result<(), String> {
         let stride = w * 4;
         let len = (stride * h) as usize;
-        let fits =
-            self.buffer.is_some() && self.buffer_size == (w, h) && self.pool.as_ref().is_some_and(|p| p.len >= len);
+        let fits = self.buffer.is_some()
+            && self.buffer_size == (w, h)
+            && self.pool.as_ref().is_some_and(|p| p.len >= len);
         if !fits {
             self.buffer = None;
             self.pool = None;
@@ -709,7 +719,9 @@ impl Client {
         }
         let phase = self.sub_commits as u32;
         let (w, h) = SUB_SIZE;
-        let buffer = match self.shm_buffer(w, h, wl_shm::Format::Xrgb8888, |x, y| sub_pattern(x, y, phase)) {
+        let buffer = match self.shm_buffer(w, h, wl_shm::Format::Xrgb8888, |x, y| {
+            sub_pattern(x, y, phase)
+        }) {
             Ok(b) => b,
             Err(why) => {
                 let _ = self.tx.send(Report::Failed(why));
@@ -888,9 +900,14 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Client {
                 surface_y,
                 ..
             } => Report::PointerMotion(surface_x, surface_y),
-            wl_pointer::Event::Button { button, state: s, .. } => Report::PointerButton(
+            wl_pointer::Event::Button {
+                button, state: s, ..
+            } => Report::PointerButton(
                 button,
-                matches!(s, wayland_client::WEnum::Value(wl_pointer::ButtonState::Pressed)),
+                matches!(
+                    s,
+                    wayland_client::WEnum::Value(wl_pointer::ButtonState::Pressed)
+                ),
             ),
             wl_pointer::Event::Axis { axis, value, .. } => match axis {
                 wayland_client::WEnum::Value(wl_pointer::Axis::HorizontalScroll) => {
