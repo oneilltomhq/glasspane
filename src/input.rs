@@ -163,17 +163,20 @@ impl Glasspane {
             .slot_of_target(target)
             .ok_or_else(|| target.missing())?;
         let surface = self.state.surface_of(slot);
+        let (ox, oy) = self.state.skin(slot).origin;
         let serial = SERIAL_COUNTER.next_serial();
         let time = self.state.now_ms();
         let pointer = self.state.pointer.clone();
         // The focus point is the surface's origin *in the pointer's own
-        // coordinate space*, and the client is told `location - origin`. Since
-        // the location we are handing over is already tenant-local, the origin
-        // is (0, 0) — which is what makes this crate's coordinate space and
-        // the client's the same space, with no transform anywhere in between.
+        // coordinate space*, and the client is told `location - origin`. The
+        // location we are handing over is tenant-local, which is the texture's
+        // space: the surface's own for most clients, its window for one that
+        // draws a shadow round it (`Skin::origin`). So the surface starts at
+        // minus the window's offset, and the client is told where it was
+        // aimed in the pixels it drew.
         pointer.motion(
             &mut self.state,
-            Some((surface, (0.0, 0.0).into())),
+            Some((surface, (-f64::from(ox), -f64::from(oy)).into())),
             &MotionEvent {
                 location: (x, y).into(),
                 serial,

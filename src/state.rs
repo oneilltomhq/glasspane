@@ -45,6 +45,10 @@ use smithay::wayland::selection::data_device::{
     DataDeviceHandler, DataDeviceState, ServerDndGrabHandler, set_data_device_focus,
 };
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
+use smithay::wayland::shell::kde::decoration::{KdeDecorationHandler, KdeDecorationState};
+use smithay::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::{
+    Mode as KdeMode, OrgKdeKwinServerDecoration,
+};
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, SurfaceCachedState, ToplevelSurface, XdgShellHandler,
     XdgShellState, XdgToplevelSurfaceData,
@@ -106,6 +110,18 @@ pub(crate) struct Shape {
     /// The `wp_viewport` source: `x, y, width, height` in surface-local
     /// logical pixels, which is buffer pixels over `buffer_scale`.
     pub(crate) source: Option<(f64, f64, f64, f64)>,
+    /// A toplevel's `xdg_surface.set_window_geometry`: `x, y, width, height`
+    /// in surface-local logical pixels. Set on a tenant's own commit only; a
+    /// popup is placed by its geometry instead (`popup_geometry_loc`), and a
+    /// subsurface has none.
+    ///
+    /// A client that draws its own decorations — GTK always does, and takes
+    /// no `zxdg_toplevel_decoration_v1` to say otherwise — sizes the
+    /// *window* to the configure and its buffer bigger by a shadow margin on
+    /// every side, saying where the window is in it with this. The texture is
+    /// the window alone ([`Shape::frame`]), so a pane shows the window it
+    /// asked for, not a shadow round it.
+    pub(crate) window: Option<(i32, i32, i32, i32)>,
 }
 
 impl Shape {
@@ -148,6 +164,36 @@ impl Shape {
         (x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32)
     }
 
+    /// The surface's picture as the texture holds it: the rectangle of a
+    /// `buffer`-pixel buffer that is its window, the logical size that is, and
+    /// where that window starts in the surface. [`Shape::crop`] and
+    /// [`Shape::logical`], then the window geometry inside them, if it is set
+    /// and leaves anything inside the surface.
+    pub(crate) fn frame(self, buffer: (u32, u32)) -> Frame {
+        let crop = self.crop(buffer);
+        let logical = self.logical((crop.2, crop.3));
+        let whole = Frame { crop, logical, origin: (0, 0) };
+        let Some((x, y, w, h)) = self.window.and_then(|g| window_in(g, logical)) else {
+            return whole;
+        };
+        // Window edges in logical pixels, scaled to the crop's texels.
+        let (kx, ky) = (
+            f64::from(crop.2) / f64::from(logical.0),
+            f64::from(crop.3) / f64::from(logical.1),
+        );
+        let at = |v: u32, k: f64| (f64::from(v) * k).round() as u32;
+        let (x0, y0) = (at(x, kx), at(y, ky));
+        let (x1, y1) = (at(x + w, kx), at(y + h, ky));
+        if x1 <= x0 || y1 <= y0 {
+            return whole;
+        }
+        Frame {
+            crop: (crop.0 + x0, crop.1 + y0, x1 - x0, y1 - y0),
+            logical: (w, h),
+            origin: (x as i32, y as i32),
+        }
+    }
+
     fn of(states: &SurfaceData) -> Shape {
         let buffer_scale = states
             .cached_state
@@ -167,8 +213,49 @@ impl Shape {
             buffer_scale,
             viewport,
             source,
+            window: None,
         }
     }
+}
+
+/// What [`Shape::frame`] makes of a buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Frame {
+    /// `x, y, width, height` in buffer pixels: the texels taken.
+    pub(crate) crop: (u32, u32, u32, u32),
+    /// The logical size they are.
+    pub(crate) logical: (u32, u32),
+    /// Where they start in the surface, in its logical pixels.
+    pub(crate) origin: (i32, i32),
+}
+
+/// A window geometry clamped to a surface of `logical` size, as
+/// `xdg_surface.set_window_geometry` says the effective geometry is: `x, y,
+/// width, height` inside it, or `None` if nothing is left or it is the whole
+/// surface anyway.
+fn window_in(window: (i32, i32, i32, i32), logical: (u32, u32)) -> Option<(u32, u32, u32, u32)> {
+    let (lw, lh) = (logical.0 as i32, logical.1 as i32);
+    let (x0, y0) = (window.0.clamp(0, lw), window.1.clamp(0, lh));
+    let (x1, y1) = (
+        window.0.saturating_add(window.2).clamp(0, lw),
+        window.1.saturating_add(window.3).clamp(0, lh),
+    );
+    if x1 <= x0 || y1 <= y0 || (x0, y0, x1, y1) == (0, 0, lw, lh) {
+        return None;
+    }
+    Some((x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32))
+}
+
+/// A toplevel's window geometry as it was last committed, if it set one.
+fn window_of(surface: &WlSurface) -> Option<(i32, i32, i32, i32)> {
+    with_states(surface, |states| {
+        states
+            .cached_state
+            .get::<SurfaceCachedState>()
+            .current()
+            .geometry
+            .map(|g| (g.loc.x, g.loc.y, g.size.w, g.size.h))
+    })
 }
 
 /// Ask one surface to draw at `scale`, through both protocols that can say
@@ -207,6 +294,11 @@ pub struct State {
     /// the `zxdg_decoration_manager_v1` global from under live clients.
     #[allow(dead_code)]
     pub(crate) xdg_decoration_state: XdgDecorationState,
+    /// Held for as long as the display: dropping it withdraws
+    /// `org_kde_kwin_server_decoration_manager`, the other way a client asks
+    /// who draws its frame, and the only one GTK4 apps that ask at all use.
+    #[allow(dead_code)]
+    pub(crate) kde_decoration_state: KdeDecorationState,
     pub(crate) shm_state: ShmState,
     pub(crate) dmabuf_state: DmabufState,
     pub(crate) dmabuf_global: Option<DmabufGlobal>,
@@ -352,7 +444,7 @@ impl State {
         }
     }
 
-    fn skin(&self, slot: Slot) -> &Skin {
+    pub(crate) fn skin(&self, slot: Slot) -> &Skin {
         match slot {
             Slot::Tenant(i) => &self.tenants[i].skin,
             Slot::Popup(i) => &self.popups[i].skin,
@@ -561,12 +653,14 @@ impl State {
         }
     }
 
-    /// The texture a buffer of `crop` texels is written into at `dest`, made
-    /// to fit first.
-    fn target(&mut self, dest: Dest<'_>, crop: (u32, u32), shape: Shape, opaque: bool) -> Arc<wgpu::Texture> {
+    /// The texture `frame`'s texels are written into at `dest`, made to fit
+    /// first.
+    fn target(&mut self, dest: Dest<'_>, frame: Frame, opaque: bool) -> Arc<wgpu::Texture> {
+        let crop = (frame.crop.2, frame.crop.3);
         match dest {
             Dest::Skin(slot) => {
-                self.ensure_texture(slot, crop, shape.logical(crop));
+                self.ensure_texture(slot, crop, frame.logical);
+                self.skin_mut(slot).origin = frame.origin;
                 self.skin(slot)
                     .texture
                     .clone()
@@ -585,7 +679,7 @@ impl State {
                         let tex = texture::create_surface_texture(device, &label, crop.0, crop.1);
                         layer.texture = Some(Arc::new(tex));
                     }
-                    layer.size = shape.logical(crop);
+                    layer.size = frame.logical;
                     layer.opaque = opaque;
                     layer.texture.clone().expect("just set")
                 })
@@ -637,8 +731,9 @@ impl State {
             })
             .map_err(|e| format!("dmabuf import failed: {e}"))?;
 
-        let crop = shape.crop((width, height));
-        let dst = self.target(dest, (crop.2, crop.3), shape, opaque);
+        let frame = shape.frame((width, height));
+        let crop = frame.crop;
+        let dst = self.target(dest, frame, opaque);
         if src.format() == dst.format() {
             texture::blit(&self.device, &self.queue, &src, &dst, crop);
         } else {
@@ -683,8 +778,9 @@ impl State {
             Err(e) => return Err(format!("buffer is neither dma-buf nor wl_shm: {e}")),
         };
         self.set_staged(dest, false);
-        let crop = shape.crop((w, h));
-        let dst = self.target(dest, (crop.2, crop.3), shape, opaque);
+        let frame = shape.frame((w, h));
+        let crop = frame.crop;
+        let dst = self.target(dest, frame, opaque);
         texture::upload_shm(&self.queue, &dst, &bytes, stride, crop);
         Ok(())
     }
@@ -738,15 +834,11 @@ fn popup_geometry_loc(surface: &WlSurface) -> (i32, i32) {
 impl State {
     /// Resolve `parent_surface` into the popup's parent, its root tenant, and
     /// the point its positioner is resolved against (the parent's window
-    /// geometry origin, in the root tenant's buffer pixels).
+    /// geometry origin, in the root tenant's logical pixels).
     fn parent_of(&self, parent_surface: &WlSurface) -> Option<(Parent, TenantId, (i32, i32))> {
         if let Some(i) = self.index_of_surface(parent_surface) {
             let id = self.tenants[i].id;
-            return Some((
-                Parent::Tenant(id),
-                id,
-                popup_geometry_loc(parent_surface),
-            ));
+            return Some((Parent::Tenant(id), id, self.tenant_base(i)));
         }
         let i = self.index_of_popup_surface(parent_surface)?;
         let p = &self.popups[i];
@@ -757,7 +849,7 @@ impl State {
     fn base_of_parent(&self, parent: Parent) -> (i32, i32) {
         match parent {
             Parent::Tenant(id) => match self.index_of(id) {
-                Some(i) => popup_geometry_loc(&self.tenants[i].surface),
+                Some(i) => self.tenant_base(i),
                 None => (0, 0),
             },
             Parent::Popup(id) => match self.index_of_popup(id) {
@@ -765,6 +857,16 @@ impl State {
                 None => (0, 0),
             },
         }
+    }
+
+    /// A tenant's window geometry origin in the tenant's own space: zero once
+    /// its texture is cut to the window (`Shape::frame`), which is the case
+    /// that matters, and the geometry's offset still for one the surface's
+    /// extent clamps.
+    fn tenant_base(&self, index: usize) -> (i32, i32) {
+        let (x, y) = popup_geometry_loc(&self.tenants[index].surface);
+        let origin = self.tenants[index].skin.origin;
+        (x - origin.0, y - origin.1)
     }
 
     /// The positioner, resolved.
@@ -1088,7 +1190,9 @@ impl State {
             }
             return;
         }
-        self.absorb_layer(surface, Some(slot), buffer, shape);
+        // The root's layer is its whole surface, as every layer is; the
+        // window is cut from the composite (`compose`).
+        self.absorb_layer(surface, Some(slot), buffer, Shape { window: None, ..shape });
     }
 
     /// A tree surface's commit: its buffer into its layer, a null buffer out
@@ -1193,12 +1297,26 @@ impl State {
                 .index_of(self.popups[i].root)
                 .map_or(1.0, |t| self.tenants[t].scale),
         };
-        let size = composite_size((base.width(), base.height()), logical, scale);
-        self.ensure_texture(slot, size, logical);
+        // A toplevel's window is cut from the tree as from a buffer drawn
+        // alone (`Shape::frame`): the texture starts at its origin and is its
+        // size, at the root layer's own density.
+        let window = match slot {
+            Slot::Tenant(_) => window_of(&root).and_then(|g| window_in(g, logical)),
+            Slot::Popup(_) => None,
+        };
+        let (origin, shown) =
+            window.map_or(((0, 0), logical), |(x, y, w, h)| ((x as i32, y as i32), (w, h)));
+        let dense = |texels: u32, of: u32, part: u32| {
+            (u64::from(texels) * u64::from(part) / u64::from(of)).max(1) as u32
+        };
+        let base_texels = (dense(base.width(), logical.0, shown.0), dense(base.height(), logical.1, shown.1));
+        let size = composite_size(base_texels, shown, scale);
+        self.ensure_texture(slot, size, shown);
+        self.skin_mut(slot).origin = origin;
         let target = self.skin(slot).texture.clone().expect("ensure_texture just set it");
         let (sx, sy) = (
-            size.0 as f32 / logical.0 as f32,
-            size.1 as f32 / logical.1 as f32,
+            size.0 as f32 / shown.0 as f32,
+            size.1 as f32 / shown.1 as f32,
         );
         let quads: Vec<Quad<'_>> = pieces
             .iter()
@@ -1207,8 +1325,8 @@ impl State {
                 Some(Quad {
                     texture,
                     rect: [
-                        p.at.0 as f32 * sx,
-                        p.at.1 as f32 * sy,
+                        (p.at.0 - origin.0) as f32 * sx,
+                        (p.at.1 - origin.1) as f32 * sy,
                         *w as f32 * sx,
                         *h as f32 * sy,
                     ],
@@ -1288,6 +1406,7 @@ impl CompositorHandler for State {
                 if !toplevel.is_initial_configure_sent() {
                     toplevel.send_configure();
                 }
+                let shape = Shape { window: window_of(surface), ..shape };
                 self.absorb_root(Slot::Tenant(index), surface, buffer, shape);
             }
             Some(Slot::Popup(index)) => {
@@ -1629,6 +1748,28 @@ fn announce_server_side(toplevel: &ToplevelSurface) {
     }
 }
 
+/// The same bare glass for a client that asks the KDE way: GTK4 has no
+/// xdg-decoration, so a GTK app that would rather not draw its own frame —
+/// Ghostty, by `window-decoration` — asks by this protocol or not at all. The
+/// manager's default says server-side, and every request is answered with
+/// it, whatever mode it asked for.
+impl KdeDecorationHandler for State {
+    fn kde_decoration_state(&self) -> &KdeDecorationState {
+        &self.kde_decoration_state
+    }
+
+    fn request_mode(
+        &mut self,
+        _surface: &WlSurface,
+        decoration: &OrgKdeKwinServerDecoration,
+        _mode: smithay::reexports::wayland_server::WEnum<KdeMode>,
+    ) {
+        decoration.mode(KdeMode::Server);
+    }
+}
+
+smithay::delegate_kde_decoration!(State);
+
 // ---------------------------------------------------------------------------
 // Seat and selection
 // ---------------------------------------------------------------------------
@@ -1723,6 +1864,7 @@ mod tests {
             buffer_scale: 1,
             viewport: Some((1434, 551)),
             source: Some((0.0, 0.0, 1434.0, 551.0)),
+            window: None,
         };
         assert_eq!(cropped.crop((1920, 1200)), (0, 0, 1434, 551));
         assert_eq!(cropped.logical((1434, 551)), (1434, 551));
@@ -1740,22 +1882,54 @@ mod tests {
 
     #[test]
     fn a_viewport_destination_is_the_logical_size() {
-        let shape = super::Shape { buffer_scale: 1, viewport: Some((390, 520)), source: None };
+        let shape = super::Shape { buffer_scale: 1, viewport: Some((390, 520)), source: None, window: None };
         assert_eq!(shape.logical((819, 1092)), (390, 520));
     }
 
     #[test]
     fn without_a_viewport_the_buffer_is_divided_by_its_scale() {
-        let shape = super::Shape { buffer_scale: 2, viewport: None, source: None };
+        let shape = super::Shape { buffer_scale: 2, viewport: None, source: None, window: None };
         assert_eq!(shape.logical((780, 1040)), (390, 520));
-        let shape = super::Shape { buffer_scale: 1, viewport: None, source: None };
+        let shape = super::Shape { buffer_scale: 1, viewport: None, source: None, window: None };
         assert_eq!(shape.logical((390, 520)), (390, 520));
     }
 
     #[test]
     fn a_nonsense_buffer_scale_is_read_as_one() {
-        let shape = super::Shape { buffer_scale: 0, viewport: None, source: None };
+        let shape = super::Shape { buffer_scale: 0, viewport: None, source: None, window: None };
         assert_eq!(shape.logical((390, 520)), (390, 520));
+    }
+
+    /// The window is cut from the picture in its logical pixels, whatever the
+    /// buffer's density, and a geometry past the surface is clamped to it.
+    #[test]
+    fn a_window_geometry_is_the_part_of_the_surface_drawn() {
+        use super::Frame;
+        let plain = super::Shape { buffer_scale: 1, viewport: None, source: None, window: Some((20, 20, 1280, 800)) };
+        assert_eq!(
+            plain.frame((1320, 840)),
+            Frame { crop: (20, 20, 1280, 800), logical: (1280, 800), origin: (20, 20) }
+        );
+        // At buffer scale 2 the margin is twice as many texels.
+        let scaled = super::Shape { buffer_scale: 2, ..plain };
+        assert_eq!(
+            scaled.frame((2640, 1680)),
+            Frame { crop: (40, 40, 2560, 1600), logical: (1280, 800), origin: (20, 20) }
+        );
+        // A fractional client: 1.5x buffer, the viewport saying its logical size.
+        let fractional = super::Shape { viewport: Some((1320, 840)), ..plain };
+        assert_eq!(
+            fractional.frame((1980, 1260)),
+            Frame { crop: (30, 30, 1920, 1200), logical: (1280, 800), origin: (20, 20) }
+        );
+        // Hanging off the top-left: the part inside the surface.
+        let off = super::Shape { window: Some((-10, -10, 100, 100)), ..plain };
+        assert_eq!(off.frame((1320, 840)), Frame { crop: (0, 0, 90, 90), logical: (90, 90), origin: (0, 0) });
+        // The whole surface, or none of it, is no cut.
+        let whole = Frame { crop: (0, 0, 1320, 840), logical: (1320, 840), origin: (0, 0) };
+        assert_eq!(super::Shape { window: Some((0, 0, 1320, 840)), ..plain }.frame((1320, 840)), whole);
+        assert_eq!(super::Shape { window: Some((2000, 0, 10, 10)), ..plain }.frame((1320, 840)), whole);
+        assert_eq!(super::Shape { window: None, ..plain }.frame((1320, 840)), whole);
     }
 
     use super::place_in;

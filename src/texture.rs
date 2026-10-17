@@ -351,6 +351,13 @@ pub(crate) struct Skin {
     /// Larger than [`Skin::size`] when the client draws at a scale above 1;
     /// `(0, 0)` before the first commit.
     pub(crate) buffer: (u32, u32),
+    /// Where the texture's top-left corner is in the surface, in its logical
+    /// pixels: a toplevel's window geometry origin, the shadow margin a client
+    /// that draws its own frame leaves around the window (see
+    /// [`crate::state::Shape::window`]). `(0, 0)` for every other surface. The
+    /// pointer is handed over shifted by it, so the shell's coordinates and
+    /// the texture's stay one space.
+    pub(crate) origin: (i32, i32),
     pub(crate) texture: Option<std::sync::Arc<wgpu::Texture>>,
     pub(crate) generation: u64,
     pub(crate) acquire_staged: bool,
