@@ -575,11 +575,17 @@ impl State {
         }
     }
 
-    /// Make sure this surface's texture is `texture` texels — its buffer,
-    /// cropped, or its tree's composite — and its logical size is `size`,
-    /// recreating the texture if it has to and saying so if either moved.
-    fn ensure_texture(&mut self, slot: Slot, texture: (u32, u32), size: (u32, u32)) {
-        let (width, height) = texture;
+    /// Make sure this surface's texture holds `frame`: its texels (the
+    /// crop's size), its logical size and its origin in the surface,
+    /// recreating the texture if it has to and saying so if texels or size
+    /// moved.
+    ///
+    /// The one place a skin's picture is described, for a buffer drawn alone
+    /// and a tree's composite alike.
+    fn ensure_texture(&mut self, slot: Slot, frame: Frame) {
+        let (width, height) = (frame.crop.2, frame.crop.3);
+        let size = frame.logical;
+        self.skin_mut(slot).origin = frame.origin;
         let fits = self
             .skin(slot)
             .texture
@@ -664,8 +670,7 @@ impl State {
         let crop = (frame.crop.2, frame.crop.3);
         match dest {
             Dest::Skin(slot, _) => {
-                self.ensure_texture(slot, crop, frame.logical);
-                self.skin_mut(slot).origin = frame.origin;
+                self.ensure_texture(slot, frame);
                 self.skin(slot)
                     .texture
                     .clone()
@@ -1325,8 +1330,8 @@ impl State {
         };
         let base_texels = (dense(base.width(), logical.0, shown.0), dense(base.height(), logical.1, shown.1));
         let size = composite_size(base_texels, shown, scale);
-        self.ensure_texture(slot, size, shown);
-        self.skin_mut(slot).origin = origin;
+        // The composite is all texels of its own.
+        self.ensure_texture(slot, Frame { crop: (0, 0, size.0, size.1), logical: shown, origin });
         let target = self.skin(slot).texture.clone().expect("ensure_texture just set it");
         let (sx, sy) = (
             size.0 as f32 / shown.0 as f32,
