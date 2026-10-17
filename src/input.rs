@@ -3,9 +3,17 @@
 //! # The coordinate contract
 //!
 //! Every pointer coordinate this crate accepts is **tenant-local, in logical
-//! pixels, origin top-left**: the same space as [`crate::Tenant::size`], and
-//! the space `wl_pointer` speaks to the client in. `(0.0, 0.0)` is the
-//! tenant's top-left corner and `(w, h)` is one past its bottom-right.
+//! pixels, origin top-left**: the same space as [`crate::Tenant::size`] and
+//! the tenant's texture. `(0.0, 0.0)` is the texture's top-left corner and
+//! `(w, h)` is one past its bottom-right.
+//!
+//! For most clients that is also the space `wl_pointer` speaks to the client
+//! in. Not for a toplevel that sets `xdg_surface.set_window_geometry` inside
+//! a bigger surface, as GTK does to draw a shadow round its window: the
+//! texture is that window alone, so tenant-local `(0.0, 0.0)` is the window's
+//! corner, and the client is told the point plus the window's offset in its
+//! surface. Either way the point a shell aims at on the texture is the pixel
+//! the client drew there.
 //!
 //! Logical, not buffer: a tenant drawing at scale 2 has a texture twice its
 //! size in each direction, and the coordinate for the same spot is the same
@@ -163,17 +171,20 @@ impl Glasspane {
             .slot_of_target(target)
             .ok_or_else(|| target.missing())?;
         let surface = self.state.surface_of(slot);
+        let (ox, oy) = self.state.skin(slot).origin;
         let serial = SERIAL_COUNTER.next_serial();
         let time = self.state.now_ms();
         let pointer = self.state.pointer.clone();
         // The focus point is the surface's origin *in the pointer's own
-        // coordinate space*, and the client is told `location - origin`. Since
-        // the location we are handing over is already tenant-local, the origin
-        // is (0, 0) — which is what makes this crate's coordinate space and
-        // the client's the same space, with no transform anywhere in between.
+        // coordinate space*, and the client is told `location - origin`. The
+        // location we are handing over is tenant-local, which is the texture's
+        // space: the surface's own for most clients, its window for one that
+        // draws a shadow round it (`Skin::origin`). So the surface starts at
+        // minus the window's offset, and the client is told where it was
+        // aimed in the pixels it drew.
         pointer.motion(
             &mut self.state,
-            Some((surface, (0.0, 0.0).into())),
+            Some((surface, (-f64::from(ox), -f64::from(oy)).into())),
             &MotionEvent {
                 location: (x, y).into(),
                 serial,

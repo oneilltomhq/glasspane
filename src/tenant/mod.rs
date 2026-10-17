@@ -86,13 +86,15 @@ impl Tenant {
         self.skin.size
     }
 
-    /// The size of the last committed buffer in pixels, cropped to its
-    /// viewport's source if it sets one: the texture's size. `(0, 0)` before
-    /// the first commit.
+    /// The texture's size in pixels: the last committed buffer, cropped to
+    /// its viewport's source if it sets one, and then to its window if it
+    /// sets `xdg_surface.set_window_geometry` inside the surface (a shadow
+    /// round the window is not drawn). `(0, 0)` before the first commit.
     ///
     /// For a surface with subsurfaces the texture is the whole tree drawn
-    /// together, and this is that picture's size: the logical size at the
-    /// denser of the surface's own buffer and the scale it was asked for.
+    /// together and cut to the window the same way, and this is that
+    /// picture's size: the window's logical size at the denser of the
+    /// surface's own buffer and the scale it was asked for.
     pub fn buffer_size(&self) -> (u32, u32) {
         self.skin.buffer
     }

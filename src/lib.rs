@@ -137,6 +137,7 @@ use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::selection::primary_selection::PrimarySelectionState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
+use smithay::wayland::shell::kde::decoration::KdeDecorationState;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::socket::ListeningSocketSource;
 
@@ -273,6 +274,10 @@ impl Glasspane {
         let viewporter_state = ViewporterState::new::<State>(&dh);
         let xdg_shell_state = XdgShellState::new::<State>(&dh);
         let xdg_decoration_state = XdgDecorationState::new::<State>(&dh);
+        let kde_decoration_state = KdeDecorationState::new::<State>(
+            &dh,
+            smithay::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration_manager::Mode::Server,
+        );
         let shm_state = ShmState::new::<State>(&dh, vec![]);
         let data_device_state = DataDeviceState::new::<State>(&dh);
         let primary_selection_state = PrimarySelectionState::new::<State>(&dh);
@@ -392,6 +397,7 @@ impl Glasspane {
             viewporter_state,
             xdg_shell_state,
             xdg_decoration_state,
+            kde_decoration_state,
             shm_state,
             dmabuf_state,
             dmabuf_global,

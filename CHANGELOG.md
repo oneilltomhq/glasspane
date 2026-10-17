@@ -8,6 +8,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- A toplevel's `xdg_surface.set_window_geometry` is honoured: the texture is
+  the window alone, `Tenant::size` its size, and the pointer is handed over
+  shifted by its offset, so a click lands where it was aimed. GTK draws every
+  window's shadow into a buffer bigger than the configure and says where the
+  window is in it this way; Ghostty, asked for 1280x800, was drawn 1320x840
+  with its shadow squeezed into the pane. A popup of such a window is placed
+  against the window, as before.
+- The `org_kde_kwin_server_decoration_manager` global, answering server-side
+  to every request as `zxdg_decoration_manager_v1` already did. GTK4 has no
+  xdg-decoration, so it is the only way a GTK app asks not to draw its own
+  title bar: Ghostty, offered it, draws none.
 - `xdg_popup`: `Glasspane::popups`, `popup`, `Popup` (id, parent, root,
   parent-relative position, size, texture, generation), and the
   `Event::Popup*` family. A popup is hosted like a toplevel — own id, own

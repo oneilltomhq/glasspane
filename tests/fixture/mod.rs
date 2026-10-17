@@ -77,6 +77,48 @@ pub enum Layout {
     /// [`Layout::Subsurface`] on top, placed to hang past the bottom-right
     /// corner.
     Stretched,
+    /// [`Layout::Alone`] drawn the way GTK draws every window: the buffer
+    /// [`SHADOW`] bigger than the configured size on every side, the lattice
+    /// over all of it, and `xdg_surface.set_window_geometry` saying the window
+    /// is the configured rectangle inside. The margin is where GTK's shadow
+    /// goes, and no pane is meant to show it.
+    Shadowed,
+    /// [`Layout::Subsurface`] with the same margin: the subsurface at
+    /// [`sub_at`] in the *surface's* pixels, so [`SHADOW`] nearer the
+    /// window's corner than in [`Layout::Subsurface`].
+    ShadowedTree,
+    /// [`Layout::Shadowed`] once, and then, on its first frame callback, a
+    /// commit with no buffer attached that moves the window to [`REFRAMED`]
+    /// in the same buffer: GTK changing its shadow without drawing again.
+    /// Nothing is committed after it.
+    Reframed,
+}
+
+/// Where a [`Layout::Reframed`] window says it is once it has moved: `x, y,
+/// width, height` in its buffer, unequal on every side so a swapped or
+/// stale coordinate shows, and a width a readback needs no padding for.
+pub const REFRAMED: (u32, u32, u32, u32) = (4, 8, 256, 192);
+
+/// The margin round a [`Layout::Shadowed`] window, in pixels.
+pub const SHADOW: u32 = 12;
+
+/// The margin `layout` draws round its window: [`SHADOW`] or none.
+pub fn margin(layout: Layout) -> u32 {
+    match layout {
+        Layout::Shadowed | Layout::ShadowedTree | Layout::Reframed => SHADOW,
+        _ => 0,
+    }
+}
+
+/// The `w` by `h` rectangle at `(x, y)` of a tightly packed `width`-wide
+/// picture: the window a shadowed buffer holds.
+pub fn cut(bytes: &[u8], width: u32, (x, y): (u32, u32), (w, h): (u32, u32)) -> Vec<u8> {
+    let mut out = Vec::with_capacity((w * h * 4) as usize);
+    for row in y..y + h {
+        let start = ((row * width + x) * 4) as usize;
+        out.extend_from_slice(&bytes[start..start + (w * 4) as usize]);
+    }
+    out
 }
 
 /// The subsurface's size, in buffer and logical pixels alike.
@@ -131,6 +173,8 @@ pub enum Report {
     Configured(i32, i32),
     /// A commit went out, carrying a buffer of this size. `n` counts them.
     Committed { n: u64, w: u32, h: u32 },
+    /// A commit went out with no buffer, moving the window to [`REFRAMED`].
+    Reframed,
     /// The subsurface committed, painted with this phase of
     /// [`sub_pattern`]. `n` counts its commits.
     SubCommitted { n: u64, phase: u32 },
@@ -438,17 +482,22 @@ impl Client {
         if w == 0 || h == 0 {
             return;
         }
-        if self.layout != Layout::Alone {
+        if self.layout == Layout::Reframed && self.commits > 0 {
+            self.reframe();
+            return;
+        }
+        if !matches!(self.layout, Layout::Alone | Layout::Shadowed | Layout::Reframed) {
             if let Err(why) = self.paint_tree(w, h) {
                 let _ = self.tx.send(Report::Failed(why));
                 self.running = false;
             }
             return;
         }
+        let (bw, bh) = self.padded(w, h);
         let ok = match self.transport {
-            Transport::Shm => self.paint_shm(w, h),
-            Transport::Dmabuf => self.paint_dmabuf(w, h, Fourcc::Argb8888),
-            Transport::DmabufAbgr => self.paint_dmabuf(w, h, Fourcc::Abgr8888),
+            Transport::Shm => self.paint_shm(bw, bh),
+            Transport::Dmabuf => self.paint_dmabuf(bw, bh, Fourcc::Argb8888),
+            Transport::DmabufAbgr => self.paint_dmabuf(bw, bh, Fourcc::Abgr8888),
         };
         if let Err(why) = ok {
             let _ = self.tx.send(Report::Failed(why));
@@ -456,16 +505,47 @@ impl Client {
             return;
         }
         let surface = self.surface.clone().expect("surface");
+        self.frame_window(w, h);
         surface.attach(self.buffer.as_ref(), 0, 0);
-        surface.damage_buffer(0, 0, w as i32, h as i32);
+        surface.damage_buffer(0, 0, bw as i32, bh as i32);
         surface.frame(&self.qh, ());
         surface.commit();
         self.commits += 1;
         let _ = self.tx.send(Report::Committed {
             n: self.commits,
-            w,
-            h,
+            w: bw,
+            h: bh,
         });
+    }
+
+    /// The buffer size for a window of `w` by `h`: bigger by the layout's
+    /// [`margin`] on every side.
+    fn padded(&self, w: u32, h: u32) -> (u32, u32) {
+        let m = margin(self.layout);
+        (w + 2 * m, h + 2 * m)
+    }
+
+    /// Say where the window is in a padded buffer, for a layout with a margin.
+    fn frame_window(&self, w: u32, h: u32) {
+        let m = margin(self.layout) as i32;
+        if m > 0 {
+            let xdg_surface = self.xdg_surface.as_ref().expect("xdg_surface");
+            xdg_surface.set_window_geometry(m, m, w as i32, h as i32);
+        }
+    }
+
+    /// [`Layout::Reframed`]'s second and last commit: the window moved, and
+    /// no buffer attached, so the one committed before is still the picture.
+    fn reframe(&mut self) {
+        if self.commits > 1 {
+            return;
+        }
+        let (x, y, w, h) = REFRAMED;
+        let xdg_surface = self.xdg_surface.as_ref().expect("xdg_surface");
+        xdg_surface.set_window_geometry(x as i32, y as i32, w as i32, h as i32);
+        self.surface.as_ref().expect("surface").commit();
+        self.commits += 1;
+        let _ = self.tx.send(Report::Reframed);
     }
 
     fn paint_shm(&mut self, w: u32, h: u32) -> Result<(), String> {
@@ -598,14 +678,16 @@ impl Client {
                 (1, 1)
             }
             _ => {
+                let (bw, bh) = self.padded(w, h);
                 match self.transport {
-                    Transport::Shm => self.paint_shm(w, h)?,
-                    Transport::Dmabuf => self.paint_dmabuf(w, h, Fourcc::Argb8888)?,
-                    Transport::DmabufAbgr => self.paint_dmabuf(w, h, Fourcc::Abgr8888)?,
+                    Transport::Shm => self.paint_shm(bw, bh)?,
+                    Transport::Dmabuf => self.paint_dmabuf(bw, bh, Fourcc::Argb8888)?,
+                    Transport::DmabufAbgr => self.paint_dmabuf(bw, bh, Fourcc::Abgr8888)?,
                 }
+                self.frame_window(w, h);
                 parent.attach(self.buffer.as_ref(), 0, 0);
-                parent.damage_buffer(0, 0, w as i32, h as i32);
-                (w, h)
+                parent.damage_buffer(0, 0, bw as i32, bh as i32);
+                (bw, bh)
             }
         };
         parent.commit();
