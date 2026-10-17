@@ -126,20 +126,20 @@ use std::time::{Duration, Instant};
 
 use smithay::input::keyboard::XkbConfig;
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel};
-use smithay::reexports::calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic};
+use smithay::reexports::calloop::{generic::Generic, EventLoop, Interest, Mode, PostAction};
 use smithay::reexports::wayland_server::Display;
 use smithay::utils::Transform;
 use smithay::wayland::compositor::CompositorState;
-use smithay::wayland::fractional_scale::FractionalScaleManagerState;
-use smithay::wayland::viewporter::ViewporterState;
 use smithay::wayland::dmabuf::DmabufState;
+use smithay::wayland::fractional_scale::FractionalScaleManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::selection::primary_selection::PrimarySelectionState;
-use smithay::wayland::shell::xdg::XdgShellState;
-use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
 use smithay::wayland::shell::kde::decoration::KdeDecorationState;
+use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
+use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::socket::ListeningSocketSource;
+use smithay::wayland::viewporter::ViewporterState;
 
 use state::{ClientState, State};
 
@@ -330,7 +330,12 @@ impl Glasspane {
             size: (caps.default_size.0 as i32, caps.default_size.1 as i32).into(),
             refresh: 60_000,
         };
-        output.change_current_state(Some(mode), Some(Transform::Normal), None, Some((0, 0).into()));
+        output.change_current_state(
+            Some(mode),
+            Some(Transform::Normal),
+            None,
+            Some((0, 0).into()),
+        );
         output.set_preferred(mode);
         output.create_global::<State>(&dh);
 
@@ -750,9 +755,7 @@ fn peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
 
 /// The DRM formats and modifiers this adapter can both import from and export
 /// to a dma-buf, in the shape `DmabufState::create_global` wants.
-fn shareable_formats(
-    adapter: &wgpu::Adapter,
-) -> Result<Vec<smithay::backend::allocator::Format>> {
+fn shareable_formats(adapter: &wgpu::Adapter) -> Result<Vec<smithay::backend::allocator::Format>> {
     use smithay::backend::allocator::Format;
     let mut out = Vec::new();
     for fourcc in texture::ACCEPTED_FOURCC {

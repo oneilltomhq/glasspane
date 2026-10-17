@@ -123,7 +123,9 @@ fn read_back(pane: &Glasspane, id: TenantId) -> Vec<u8> {
     queue.submit([encoder.finish()]);
     let slice = staging.slice(..);
     slice.map_async(wgpu::MapMode::Read, |r| r.expect("map"));
-    device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
     let out = slice.get_mapped_range().expect("mapped range").to_vec();
     staging.unmap();
     out
@@ -147,9 +149,12 @@ fn first_difference(got: &[u8], want: &[u8], width: u32) -> Option<String> {
     None
 }
 
-fn start(tag: &str, adapter: Option<&wgpu::Adapter>, device: wgpu::Device, queue: wgpu::Queue)
-    -> Glasspane
-{
+fn start(
+    tag: &str,
+    adapter: Option<&wgpu::Adapter>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+) -> Glasspane {
     let name = socket_name(tag);
     let mut caps = Caps::new().with_socket_name(name).with_size(256, 256);
     if let Some(a) = adapter {
@@ -236,9 +241,15 @@ fn an_shm_tenant_texture_is_byte_exact() {
     // And the client is painting because it is being ticked, not because
     // anybody asked: it has been handed frame callbacks and has used them.
     let (callbacks, ticks) = pane.frame_stats();
-    assert!(callbacks > 0, "no frame callbacks were answered in {ticks} ticks");
     assert!(
-        client.drain().iter().any(|r| matches!(r, Report::Committed { n, .. } if *n >= 2)),
+        callbacks > 0,
+        "no frame callbacks were answered in {ticks} ticks"
+    );
+    assert!(
+        client
+            .drain()
+            .iter()
+            .any(|r| matches!(r, Report::Committed { n, .. } if *n >= 2)),
         "the client never repainted, so the frame clock drove nothing"
     );
 }
@@ -277,7 +288,10 @@ fn a_dmabuf_tenant_texture_is_byte_exact() {
     });
     let (imports, hits) = pane.import_stats();
     assert_eq!(imports, 1, "one wl_buffer must produce exactly one import");
-    assert!(hits >= 5, "the re-commits must have hit the cache, got {hits}");
+    assert!(
+        hits >= 5,
+        "the re-commits must have hit the cache, got {hits}"
+    );
 
     let report = pane.acquire_report().expect("this device can fence");
     assert!(
@@ -309,7 +323,10 @@ fn an_abgr_dmabuf_tenant_texture_is_byte_exact() {
     let (_client, id) = map_tenant(&mut pane, Transport::DmabufAbgr, &mut events);
 
     let tenant = pane.tenant(id).unwrap();
-    assert_eq!(tenant.texture().unwrap().format(), glasspane::texture::TENANT_FORMAT);
+    assert_eq!(
+        tenant.texture().unwrap().format(),
+        glasspane::texture::TENANT_FORMAT
+    );
     let (w, h) = tenant.size();
     let got = read_back(&pane, id);
     assert_eq!(
@@ -373,19 +390,27 @@ fn a_pointer_click_arrives_where_it_was_aimed() {
     pane.pointer_enter(id, 12.5, 7.5).unwrap();
     pane.pointer_button(glasspane::input::button::LEFT, KeyState::Pressed);
     pane.pointer_button(glasspane::input::button::LEFT, KeyState::Released);
-    pump(&mut pane, &mut events, Duration::from_millis(500), |_, _| false);
+    pump(
+        &mut pane,
+        &mut events,
+        Duration::from_millis(500),
+        |_, _| false,
+    );
 
     // wl_fixed carries 1/256ths, so .5 is exact and a mismatch here is a
     // transform, not a rounding error.
-    client.expect(Duration::from_secs(2), |r| {
-        matches!(r, Report::PointerEnter(x, y) if *x == 12.5 && *y == 7.5)
-    });
-    client.expect(Duration::from_secs(2), |r| {
-        matches!(r, Report::PointerButton(b, true) if *b == glasspane::input::button::LEFT)
-    });
-    client.expect(Duration::from_secs(2), |r| {
-        matches!(r, Report::PointerButton(b, false) if *b == glasspane::input::button::LEFT)
-    });
+    client.expect(
+        Duration::from_secs(2),
+        |r| matches!(r, Report::PointerEnter(x, y) if *x == 12.5 && *y == 7.5),
+    );
+    client.expect(
+        Duration::from_secs(2),
+        |r| matches!(r, Report::PointerButton(b, true) if *b == glasspane::input::button::LEFT),
+    );
+    client.expect(
+        Duration::from_secs(2),
+        |r| matches!(r, Report::PointerButton(b, false) if *b == glasspane::input::button::LEFT),
+    );
 }
 
 /// **A key arrives as the same evdev code it was sent as.**
@@ -402,7 +427,12 @@ fn a_key_survives_the_xkb_offset() {
     // must carry. 38 would be the same key with the xkb offset applied twice.
     pane.keyboard_key(Some(id), 30, KeyState::Pressed).unwrap();
     pane.keyboard_key(Some(id), 30, KeyState::Released).unwrap();
-    pump(&mut pane, &mut events, Duration::from_millis(500), |_, _| false);
+    pump(
+        &mut pane,
+        &mut events,
+        Duration::from_millis(500),
+        |_, _| false,
+    );
 
     client.expect(Duration::from_secs(2), |r| *r == Report::Key(30, true));
     client.expect(Duration::from_secs(2), |r| *r == Report::Key(30, false));
@@ -437,10 +467,14 @@ fn a_resize_is_reported_by_id_not_by_list_position() {
     assert_eq!(pane.tenant(second).unwrap().configured(), Some((512, 128)));
 
     let resized = pump(&mut pane, &mut events, Duration::from_secs(10), |_, evs| {
-        evs.iter()
-            .any(|e| matches!(e, Event::Resized { id, size } if *id == second && *size == (512, 128)))
+        evs.iter().any(
+            |e| matches!(e, Event::Resized { id, size } if *id == second && *size == (512, 128)),
+        )
     });
-    assert!(resized, "the client never painted at the new size: {events:?}");
+    assert!(
+        resized,
+        "the client never painted at the new size: {events:?}"
+    );
 
     assert_eq!(pane.tenant(second).unwrap().size(), (512, 128));
     assert_eq!(
@@ -449,15 +483,18 @@ fn a_resize_is_reported_by_id_not_by_list_position() {
         "the tenant that was not configured must not have moved"
     );
     assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e, Event::Resized { id, size } if *id == first && *size != (256, 256))),
+        !events.iter().any(
+            |e| matches!(e, Event::Resized { id, size } if *id == first && *size != (256, 256))
+        ),
         "the untouched tenant was reported as resized"
     );
 
     // And the new size is really in the texture, not just in the bookkeeping.
     let got = read_back(&pane, second);
-    assert_eq!(first_difference(&got, &fixture::expected(512, 128), 512), None);
+    assert_eq!(
+        first_difference(&got, &fixture::expected(512, 128), 512),
+        None
+    );
 }
 
 /// **Nothing paints without a tick.**
@@ -491,7 +528,11 @@ fn a_client_that_is_never_ticked_stalls_after_one_frame() {
         1,
         "an unticked client painted more than the one frame it starts with"
     );
-    assert_eq!(pane.frame_stats().0, 0, "no callbacks can have been answered");
+    assert_eq!(
+        pane.frame_stats().0,
+        0,
+        "no callbacks can have been answered"
+    );
     let commits = client
         .drain()
         .iter()
@@ -684,7 +725,11 @@ fn a_scaled_tenant_paints_more_pixels_at_the_same_size() {
             t.buffer_size()
         );
         let tex = t.texture().unwrap();
-        assert_eq!((tex.width(), tex.height()), buffer, "the texture is the buffer");
+        assert_eq!(
+            (tex.width(), tex.height()),
+            buffer,
+            "the texture is the buffer"
+        );
     };
 
     settle(&mut pane, &mut events, (390, 520));
@@ -752,18 +797,41 @@ fn two_tenants_callbacks_are_released_apart() {
     while gen(&pane, a) < a0 + 10 && Instant::now() < deadline {
         turn(&mut pane, a, &mut asked);
     }
-    assert!(gen(&pane, a) >= a0 + 10, "the picked tenant painted {} frames in 5 s", gen(&pane, a) - a0);
-    assert!(sent(&pane, a) >= a_sent + 10, "the picked tenant was handed {} callbacks", sent(&pane, a) - a_sent);
+    assert!(
+        gen(&pane, a) >= a0 + 10,
+        "the picked tenant painted {} frames in 5 s",
+        gen(&pane, a) - a0
+    );
+    assert!(
+        sent(&pane, a) >= a_sent + 10,
+        "the picked tenant was handed {} callbacks",
+        sent(&pane, a) - a_sent
+    );
     assert_eq!(gen(&pane, b), b0, "the tenant left out painted");
-    assert_eq!(sent(&pane, b), b_sent, "the tenant left out was handed a callback");
-    assert!(asked.contains(&b), "the tenant left out was never asked about, so it held no callback");
+    assert_eq!(
+        sent(&pane, b),
+        b_sent,
+        "the tenant left out was handed a callback"
+    );
+    assert!(
+        asked.contains(&b),
+        "the tenant left out was never asked about, so it held no callback"
+    );
     let (callbacks, _) = pane.frame_stats();
-    assert_eq!(callbacks, sent(&pane, a) + sent(&pane, b), "the run's total is the tenants' sum");
+    assert_eq!(
+        callbacks,
+        sent(&pane, a) + sent(&pane, b),
+        "the run's total is the tenants' sum"
+    );
 
     // Picked once: the held callback is answered, and `b` paints again.
     let b1 = gen(&pane, b);
     turn(&mut pane, b, &mut asked);
-    assert_eq!(sent(&pane, b), b_sent + 1, "the held callback, answered on the first tick picked");
+    assert_eq!(
+        sent(&pane, b),
+        b_sent + 1,
+        "the held callback, answered on the first tick picked"
+    );
     let deadline = Instant::now() + Duration::from_secs(2);
     while gen(&pane, b) == b1 && Instant::now() < deadline {
         turn(&mut pane, b, &mut asked);
@@ -791,10 +859,20 @@ fn tree_is_composited(tag: &str, transport: Transport, layout: Layout) -> Option
     let mut reports = Vec::new();
     let painted = pump(&mut pane, &mut events, Duration::from_secs(10), |_, _| {
         reports.extend(client.drain());
-        reports.iter().any(|r| matches!(r, Report::SubCommitted { phase: 1, .. }))
+        reports
+            .iter()
+            .any(|r| matches!(r, Report::SubCommitted { phase: 1, .. }))
     });
-    assert!(painted, "the subsurface never painted its second frame; it reported {reports:?}");
-    pump(&mut pane, &mut events, Duration::from_millis(100), |_, _| false);
+    assert!(
+        painted,
+        "the subsurface never painted its second frame; it reported {reports:?}"
+    );
+    pump(
+        &mut pane,
+        &mut events,
+        Duration::from_millis(100),
+        |_, _| false,
+    );
     reports.extend(client.drain());
 
     let (w, h) = pane.tenant(id).unwrap().size();
@@ -842,21 +920,39 @@ fn a_shadowed_window_is_its_window_alone(tag: &str, transport: Transport) {
 
     let m = fixture::SHADOW;
     let tenant = pane.tenant(id).unwrap();
-    assert_eq!(tenant.size(), (256, 256), "the size is the window's, not the buffer's");
-    assert_eq!(tenant.buffer_size(), (256, 256), "the texture is the window's texels");
+    assert_eq!(
+        tenant.size(),
+        (256, 256),
+        "the size is the window's, not the buffer's"
+    );
+    assert_eq!(
+        tenant.buffer_size(),
+        (256, 256),
+        "the texture is the window's texels"
+    );
     let whole = fixture::expected(256 + 2 * m, 256 + 2 * m);
     assert_eq!(
-        first_difference(&read_back(&pane, id), &fixture::cut(&whole, 256 + 2 * m, (m, m), (256, 256)), 256),
+        first_difference(
+            &read_back(&pane, id),
+            &fixture::cut(&whole, 256 + 2 * m, (m, m), (256, 256)),
+            256
+        ),
         None,
         "the texture is not the window cut from the shadowed buffer"
     );
 
     pane.pointer_enter(id, 12.5, 7.5).unwrap();
-    pump(&mut pane, &mut events, Duration::from_millis(300), |_, _| false);
+    pump(
+        &mut pane,
+        &mut events,
+        Duration::from_millis(300),
+        |_, _| false,
+    );
     let (x, y) = (12.5 + f64::from(m), 7.5 + f64::from(m));
-    client.expect(Duration::from_secs(2), |r| {
-        matches!(r, Report::PointerEnter(px, py) if *px == x && *py == y)
-    });
+    client.expect(
+        Duration::from_secs(2),
+        |r| matches!(r, Report::PointerEnter(px, py) if *px == x && *py == y),
+    );
 }
 
 #[test]
@@ -892,23 +988,42 @@ fn a_reframed_window_is_cut_again(tag: &str, transport: Transport) {
     let moved = pump(&mut pane, &mut events, Duration::from_secs(5), |pane, _| {
         pane.tenant(id).unwrap().size() == (w, h)
     });
-    assert!(moved, "the size stayed {:?}, not the window's {:?}", pane.tenant(id).unwrap().size(), (w, h));
-    assert_eq!(pane.tenant(id).unwrap().buffer_size(), (w, h), "the texture is the window's texels");
+    assert!(
+        moved,
+        "the size stayed {:?}, not the window's {:?}",
+        pane.tenant(id).unwrap().size(),
+        (w, h)
+    );
+    assert_eq!(
+        pane.tenant(id).unwrap().buffer_size(),
+        (w, h),
+        "the texture is the window's texels"
+    );
 
     let m = fixture::SHADOW;
     let whole = fixture::expected(256 + 2 * m, 256 + 2 * m);
     assert_eq!(
-        first_difference(&read_back(&pane, id), &fixture::cut(&whole, 256 + 2 * m, (x, y), (w, h)), w),
+        first_difference(
+            &read_back(&pane, id),
+            &fixture::cut(&whole, 256 + 2 * m, (x, y), (w, h)),
+            w
+        ),
         None,
         "the texture is not the window cut from where it now is"
     );
 
     pane.pointer_enter(id, 12.5, 7.5).unwrap();
-    pump(&mut pane, &mut events, Duration::from_millis(300), |_, _| false);
+    pump(
+        &mut pane,
+        &mut events,
+        Duration::from_millis(300),
+        |_, _| false,
+    );
     let (px, py) = (12.5 + f64::from(x), 7.5 + f64::from(y));
-    client.expect(Duration::from_secs(2), |r| {
-        matches!(r, Report::PointerEnter(ex, ey) if *ex == px && *ey == py)
-    });
+    client.expect(
+        Duration::from_secs(2),
+        |r| matches!(r, Report::PointerEnter(ex, ey) if *ex == px && *ey == py),
+    );
 }
 
 #[test]

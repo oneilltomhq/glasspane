@@ -353,7 +353,12 @@ impl Glasspane {
     /// per-tenant does not have to remember to call
     /// [`Glasspane::set_keyboard_focus`], and a caller that has already set
     /// focus passes `None`.
-    pub fn keyboard_key(&mut self, to: Option<TenantId>, evdev: u32, state: KeyState) -> Result<()> {
+    pub fn keyboard_key(
+        &mut self,
+        to: Option<TenantId>,
+        evdev: u32,
+        state: KeyState,
+    ) -> Result<()> {
         self.keyboard_key_at(to.map(Target::Tenant), evdev, state)
     }
 

@@ -1,0 +1,15 @@
+# rustfmt's defaults, written down. Most of the tree (acquire, compose,
+# texture, tenant/browser, examples) was already formatted at the default
+# width of 100, and the drift was in a few files edited by hand since.
+# Measured against main at 27a5081, `cargo fmt` rewrites:
+#
+#   defaults (max_width = 100)                 7 files, +435 -127
+#   max_width = 110                           10 files, +290 -180
+#   max_width = 120                           14 files, +282 -314
+#   max_width = 110, use_small_heuristics=Max 14 files, +227 -595
+#
+# 110 and 120 re-join lines in files that are clean today, and upfront's
+# shell config (110 with "Max") rewrites every file, so the code was not
+# written to it. The file exists so that the setting is stated and a
+# rustfmt.toml in a parent directory is never picked up instead.
+max_width = 100
