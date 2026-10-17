@@ -87,7 +87,17 @@ pub enum Layout {
     /// [`sub_at`] in the *surface's* pixels, so [`SHADOW`] nearer the
     /// window's corner than in [`Layout::Subsurface`].
     ShadowedTree,
+    /// [`Layout::Shadowed`] once, and then, on its first frame callback, a
+    /// commit with no buffer attached that moves the window to [`REFRAMED`]
+    /// in the same buffer: GTK changing its shadow without drawing again.
+    /// Nothing is committed after it.
+    Reframed,
 }
+
+/// Where a [`Layout::Reframed`] window says it is once it has moved: `x, y,
+/// width, height` in its buffer, unequal on every side so a swapped or
+/// stale coordinate shows, and a width a readback needs no padding for.
+pub const REFRAMED: (u32, u32, u32, u32) = (4, 8, 256, 192);
 
 /// The margin round a [`Layout::Shadowed`] window, in pixels.
 pub const SHADOW: u32 = 12;
@@ -95,7 +105,7 @@ pub const SHADOW: u32 = 12;
 /// The margin `layout` draws round its window: [`SHADOW`] or none.
 pub fn margin(layout: Layout) -> u32 {
     match layout {
-        Layout::Shadowed | Layout::ShadowedTree => SHADOW,
+        Layout::Shadowed | Layout::ShadowedTree | Layout::Reframed => SHADOW,
         _ => 0,
     }
 }
@@ -163,6 +173,8 @@ pub enum Report {
     Configured(i32, i32),
     /// A commit went out, carrying a buffer of this size. `n` counts them.
     Committed { n: u64, w: u32, h: u32 },
+    /// A commit went out with no buffer, moving the window to [`REFRAMED`].
+    Reframed,
     /// The subsurface committed, painted with this phase of
     /// [`sub_pattern`]. `n` counts its commits.
     SubCommitted { n: u64, phase: u32 },
@@ -470,7 +482,11 @@ impl Client {
         if w == 0 || h == 0 {
             return;
         }
-        if !matches!(self.layout, Layout::Alone | Layout::Shadowed) {
+        if self.layout == Layout::Reframed && self.commits > 0 {
+            self.reframe();
+            return;
+        }
+        if !matches!(self.layout, Layout::Alone | Layout::Shadowed | Layout::Reframed) {
             if let Err(why) = self.paint_tree(w, h) {
                 let _ = self.tx.send(Report::Failed(why));
                 self.running = false;
@@ -516,6 +532,20 @@ impl Client {
             let xdg_surface = self.xdg_surface.as_ref().expect("xdg_surface");
             xdg_surface.set_window_geometry(m, m, w as i32, h as i32);
         }
+    }
+
+    /// [`Layout::Reframed`]'s second and last commit: the window moved, and
+    /// no buffer attached, so the one committed before is still the picture.
+    fn reframe(&mut self) {
+        if self.commits > 1 {
+            return;
+        }
+        let (x, y, w, h) = REFRAMED;
+        let xdg_surface = self.xdg_surface.as_ref().expect("xdg_surface");
+        xdg_surface.set_window_geometry(x as i32, y as i32, w as i32, h as i32);
+        self.surface.as_ref().expect("surface").commit();
+        self.commits += 1;
+        let _ = self.tx.send(Report::Reframed);
     }
 
     fn paint_shm(&mut self, w: u32, h: u32) -> Result<(), String> {

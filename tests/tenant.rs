@@ -869,6 +869,58 @@ fn a_shadowed_dmabuf_window_is_its_window_alone() {
     a_shadowed_window_is_its_window_alone("shadow-dmabuf", Transport::Dmabuf);
 }
 
+/// **A window that moves in its buffer with no new buffer is cut again.**
+///
+/// `set_window_geometry` is double-buffered state like any other, and a
+/// commit can carry it alone: GTK changing its shadow without drawing again.
+/// The texture, the size and the pointer's offset must follow the window to
+/// where it now says it is, in the buffer committed before.
+fn a_reframed_window_is_cut_again(tag: &str, transport: Transport) {
+    let Some((adapter, device, queue)) = gpu() else {
+        return;
+    };
+    let adapter = (transport == Transport::Dmabuf).then_some(&adapter);
+    let mut pane = start(tag, adapter, device, queue);
+    if transport == Transport::Dmabuf && !pane.advertises_dmabuf() {
+        eprintln!("SKIP: this adapter shares no single-plane ARGB8888 modifiers");
+        return;
+    }
+    let mut events = Vec::new();
+    let (client, id) = map_tree(&mut pane, transport, Layout::Reframed, &mut events);
+    client.expect(Duration::from_secs(5), |r| matches!(r, Report::Reframed));
+    let (x, y, w, h) = fixture::REFRAMED;
+    let moved = pump(&mut pane, &mut events, Duration::from_secs(5), |pane, _| {
+        pane.tenant(id).unwrap().size() == (w, h)
+    });
+    assert!(moved, "the size stayed {:?}, not the window's {:?}", pane.tenant(id).unwrap().size(), (w, h));
+    assert_eq!(pane.tenant(id).unwrap().buffer_size(), (w, h), "the texture is the window's texels");
+
+    let m = fixture::SHADOW;
+    let whole = fixture::expected(256 + 2 * m, 256 + 2 * m);
+    assert_eq!(
+        first_difference(&read_back(&pane, id), &fixture::cut(&whole, 256 + 2 * m, (x, y), (w, h)), w),
+        None,
+        "the texture is not the window cut from where it now is"
+    );
+
+    pane.pointer_enter(id, 12.5, 7.5).unwrap();
+    pump(&mut pane, &mut events, Duration::from_millis(300), |_, _| false);
+    let (px, py) = (12.5 + f64::from(x), 7.5 + f64::from(y));
+    client.expect(Duration::from_secs(2), |r| {
+        matches!(r, Report::PointerEnter(ex, ey) if *ex == px && *ey == py)
+    });
+}
+
+#[test]
+fn a_reframed_shm_window_is_cut_again() {
+    a_reframed_window_is_cut_again("reframe-shm", Transport::Shm);
+}
+
+#[test]
+fn a_reframed_dmabuf_window_is_cut_again() {
+    a_reframed_window_is_cut_again("reframe-dmabuf", Transport::Dmabuf);
+}
+
 /// The same window with a subsurface over it: the tree is drawn over the whole
 /// surface and the window cut from the composite, the subsurface where the
 /// client put it in the surface, so the margin nearer the window's corner.
