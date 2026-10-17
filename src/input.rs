@@ -3,9 +3,17 @@
 //! # The coordinate contract
 //!
 //! Every pointer coordinate this crate accepts is **tenant-local, in logical
-//! pixels, origin top-left**: the same space as [`crate::Tenant::size`], and
-//! the space `wl_pointer` speaks to the client in. `(0.0, 0.0)` is the
-//! tenant's top-left corner and `(w, h)` is one past its bottom-right.
+//! pixels, origin top-left**: the same space as [`crate::Tenant::size`] and
+//! the tenant's texture. `(0.0, 0.0)` is the texture's top-left corner and
+//! `(w, h)` is one past its bottom-right.
+//!
+//! For most clients that is also the space `wl_pointer` speaks to the client
+//! in. Not for a toplevel that sets `xdg_surface.set_window_geometry` inside
+//! a bigger surface, as GTK does to draw a shadow round its window: the
+//! texture is that window alone, so tenant-local `(0.0, 0.0)` is the window's
+//! corner, and the client is told the point plus the window's offset in its
+//! surface. Either way the point a shell aims at on the texture is the pixel
+//! the client drew there.
 //!
 //! Logical, not buffer: a tenant drawing at scale 2 has a texture twice its
 //! size in each direction, and the coordinate for the same spot is the same
