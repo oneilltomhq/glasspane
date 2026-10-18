@@ -1082,3 +1082,103 @@ fn a_subsurface_over_a_dmabuf_parent_is_composited() {
 fn a_stretched_root_is_composited_at_its_logical_size() {
     let _ = tree_is_composited("sub-stretched", Transport::Shm, Layout::Stretched);
 }
+
+// ---------------------------------------------------------------------------
+// Which GPU a client is told to use
+// ---------------------------------------------------------------------------
+
+/// Pump `pane` until a fixture thread answers on `rx`.
+fn answer<T>(pane: &mut Glasspane, rx: std::sync::mpsc::Receiver<T>) -> T {
+    let mut got = None;
+    let mut events = Vec::new();
+    pump(pane, &mut events, Duration::from_secs(10), |_, _| {
+        got = got.take().or_else(|| rx.try_recv().ok());
+        got.is_some()
+    });
+    got.expect("the client thread never answered")
+}
+
+fn read_feedback(pane: &mut Glasspane, version: u32) -> fixture::feedback::Seen {
+    let (tx, rx) = std::sync::mpsc::channel();
+    fixture::feedback::read(pane.socket_name().to_owned(), version, tx);
+    answer(pane, rx).expect("read the dma-buf global")
+}
+
+/// **The feedback names the render node.** A v4 client is told the
+/// adapter's render node as the main device, and offered there, with no
+/// scanout flag, exactly the pairs a v3 client is offered as `modifier`
+/// events: the version a client binds changes how it is told, not what.
+#[test]
+fn the_dmabuf_feedback_names_the_render_node() {
+    let Some((adapter, device, queue)) = gpu() else {
+        return;
+    };
+    let Some(node) = wgpu_dmabuf::device::render_node(&adapter).expect("render_node") else {
+        eprintln!("SKIP: this adapter has no render node to name");
+        return;
+    };
+    let mut pane = start("feedback", Some(&adapter), device, queue);
+    if !pane.advertises_dmabuf() {
+        eprintln!("SKIP: this adapter shares no single-plane ARGB8888 modifiers");
+        return;
+    }
+    assert_eq!(pane.dmabuf_main_device(), Some(node));
+
+    let v4 = read_feedback(&mut pane, 4);
+    let v3 = read_feedback(&mut pane, 3);
+    assert!(v4.version >= 4, "the global is only v{}", v4.version);
+    assert_eq!(v4.main_device, Some(node), "{v4:?}");
+    assert!(!v4.table.is_empty(), "an empty format table: {v4:?}");
+    let main: Vec<_> = v4
+        .tranches
+        .iter()
+        .filter(|t| t.target_device == Some(node))
+        .collect();
+    assert!(
+        !main.is_empty(),
+        "no tranche targets the main device: {v4:?}"
+    );
+    assert!(
+        main.iter().all(|t| t.flags == 0),
+        "nothing here scans out, so no tranche may say so: {v4:?}"
+    );
+    let offered: std::collections::BTreeSet<_> = main
+        .iter()
+        .flat_map(|t| t.formats.iter().copied())
+        .collect();
+    assert!(!v3.modifiers.is_empty(), "a v3 bind heard no modifiers");
+    assert_eq!(
+        offered, v3.modifiers,
+        "a v4 client and a v3 client were offered different formats"
+    );
+}
+
+/// **A GL client gets the GPU, not llvmpipe.** This is the claim the
+/// feedback exists for: Mesa's EGL takes its device from `main_device` and
+/// nowhere else, so on a global that names none Ghostty rendered on the CPU.
+#[test]
+fn a_gl_client_renders_on_the_gpu() {
+    let Some((adapter, device, queue)) = gpu() else {
+        return;
+    };
+    if adapter.get_info().device_type == wgpu::DeviceType::Cpu {
+        eprintln!("SKIP: the compositor's own adapter is software");
+        return;
+    }
+    let mut pane = start("egl", Some(&adapter), device, queue);
+    if !pane.advertises_dmabuf() {
+        eprintln!("SKIP: this adapter shares no single-plane ARGB8888 modifiers");
+        return;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    fixture::egl::renderer(pane.socket_name().to_owned(), tx);
+    let Some(renderer) = answer(&mut pane, rx).expect("EGL on the pane") else {
+        eprintln!("SKIP: no libEGL or libwayland-client on this machine");
+        return;
+    };
+    eprintln!("GL_RENDERER: {renderer}");
+    assert!(
+        !renderer.contains("llvmpipe") && !renderer.contains("softpipe"),
+        "a GL client on the pane fell back to software: {renderer}"
+    );
+}
