@@ -76,6 +76,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `Event::Resized` and `Event::PopupResized` fire when the logical size or
   the buffer's moves, so a repaint at a new scale is announced with the same
   `size`. Their fields are unchanged.
+- `zwp_linux_dmabuf_v1` is advertised with default feedback naming the
+  adapter's render node as its main device (`wgpu_dmabuf::device::render_node`),
+  so the global is v4 and up. Mesa's EGL takes its GPU from that event and
+  nowhere else: on the v3 global, Ghostty rendered on llvmpipe at well over a
+  core. A v3 client is offered the same pairs as before. An adapter with no
+  render node (a software one) keeps the v3 global.
+  `Glasspane::dmabuf_main_device` says which, since `advertises_dmabuf` alone
+  reads true either way.
 
 ## [0.1.0] - 2026-09-14
 

@@ -130,7 +130,7 @@ use smithay::reexports::calloop::{generic::Generic, EventLoop, Interest, Mode, P
 use smithay::reexports::wayland_server::Display;
 use smithay::utils::Transform;
 use smithay::wayland::compositor::CompositorState;
-use smithay::wayland::dmabuf::DmabufState;
+use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufState};
 use smithay::wayland::fractional_scale::FractionalScaleManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::selection::primary_selection::PrimarySelectionState;
@@ -301,11 +301,23 @@ impl Glasspane {
             }
         };
         let fenced = acquire.is_some();
+        // With a render node the global is v4 and up, and its default
+        // feedback names that node as the main device. That is not optional
+        // for GL clients: Mesa's EGL takes its GPU from `main_device` and
+        // nowhere else, so on a v3 global Ghostty rendered on llvmpipe. With
+        // no node (a software adapter) the v3 global is the honest answer.
+        let mut dmabuf_main_device = None;
         let dmabuf_global = match caps.adapter {
             Some(adapter) if fenced || caps.allow_unfenced_dmabuf => {
                 let formats = shareable_formats(adapter)?;
                 if formats.is_empty() {
                     None
+                } else if let Some(node) = wgpu_dmabuf::device::render_node(adapter)? {
+                    let feedback = DmabufFeedbackBuilder::new(node, formats)
+                        .build()
+                        .map_err(|e| Error::Device(format!("dma-buf feedback: {e}")))?;
+                    dmabuf_main_device = Some(node);
+                    Some(dmabuf_state.create_global_with_default_feedback::<State>(&dh, &feedback))
                 } else {
                     Some(dmabuf_state.create_global::<State>(&dh, formats))
                 }
@@ -406,6 +418,7 @@ impl Glasspane {
             shm_state,
             dmabuf_state,
             dmabuf_global,
+            dmabuf_main_device,
             data_device_state,
             primary_selection_state,
             seat_state,
@@ -450,6 +463,17 @@ impl Glasspane {
     /// every tenant will be an `wl_shm` tenant.
     pub fn advertises_dmabuf(&self) -> bool {
         self.state.dmabuf_global.is_some()
+    }
+
+    /// The render node the dma-buf global names as its main device, as a
+    /// `dev_t`, or `None` when it names none.
+    ///
+    /// `None` alongside [`Glasspane::advertises_dmabuf`] is a v3 global: GL
+    /// clients can still hand over dma-bufs, but Mesa finds no GPU through
+    /// it and renders them on the CPU. Worth saying in a shell's log, since
+    /// `advertises_dmabuf` alone reads as all being well.
+    pub fn dmabuf_main_device(&self) -> Option<libc::dev_t> {
+        self.state.dmabuf_main_device
     }
 
     /// Spawn a client on this compositor's socket.

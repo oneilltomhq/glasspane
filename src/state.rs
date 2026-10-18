@@ -310,6 +310,9 @@ pub struct State {
     pub(crate) shm_state: ShmState,
     pub(crate) dmabuf_state: DmabufState,
     pub(crate) dmabuf_global: Option<DmabufGlobal>,
+    /// What the global's default feedback names; see
+    /// [`crate::Glasspane::dmabuf_main_device`].
+    pub(crate) dmabuf_main_device: Option<libc::dev_t>,
     pub(crate) data_device_state: DataDeviceState,
     pub(crate) primary_selection_state: PrimarySelectionState,
     pub(crate) seat_state: SeatState<Self>,

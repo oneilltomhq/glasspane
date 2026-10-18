@@ -49,6 +49,9 @@ use wayland_protocols::xdg::shell::client::{
     xdg_wm_base::{self, XdgWmBase},
 };
 
+pub mod egl;
+pub mod feedback;
+
 /// Which transport the fixture commits through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
@@ -304,7 +307,7 @@ impl Drop for Fixture {
     }
 }
 
-fn socket_path(socket_name: &std::ffi::OsStr) -> PathBuf {
+pub fn socket_path(socket_name: &std::ffi::OsStr) -> PathBuf {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .unwrap_or_else(|| format!("/run/user/{}", unsafe { libc::getuid() }).into());
     PathBuf::from(runtime).join(socket_name)
