@@ -35,6 +35,9 @@ pub enum Error {
     /// A scale that is not a finite number above zero. See
     /// [`crate::Glasspane::set_scale`].
     BadScale(f64),
+    /// The display handle given to [`crate::Glasspane::bridge_clipboard`]
+    /// is not a Wayland one, or could not be had.
+    Clipboard(String),
 }
 
 impl fmt::Display for Error {
@@ -49,6 +52,7 @@ impl fmt::Display for Error {
             Error::Spawn(e) => write!(f, "spawn: {e}"),
             Error::Dispatch(e) => write!(f, "dispatch: {e}"),
             Error::BadScale(s) => write!(f, "scale {s} is not a finite number above zero"),
+            Error::Clipboard(s) => write!(f, "desktop clipboard: {s}"),
         }
     }
 }

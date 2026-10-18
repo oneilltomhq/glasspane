@@ -37,12 +37,14 @@ use smithay::wayland::fractional_scale::{
 };
 use smithay::wayland::viewporter::{ViewportCachedState, ViewporterState};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier, get_dmabuf};
-use smithay::wayland::selection::SelectionHandler;
+use smithay::wayland::selection::{SelectionHandler, SelectionSource, SelectionTarget};
 use smithay::wayland::selection::primary_selection::{
     PrimarySelectionHandler, PrimarySelectionState, set_primary_focus,
 };
 use smithay::wayland::selection::data_device::{
-    DataDeviceHandler, DataDeviceState, ServerDndGrabHandler, set_data_device_focus,
+    DataDeviceHandler, DataDeviceState, ServerDndGrabHandler, clear_data_device_selection,
+    current_data_device_selection_userdata, request_data_device_client_selection,
+    set_data_device_focus, set_data_device_selection,
 };
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
 use smithay::wayland::shell::kde::decoration::{KdeDecorationHandler, KdeDecorationState};
@@ -56,6 +58,7 @@ use smithay::wayland::shell::xdg::{
 use smithay::wayland::shm::{ShmHandler, ShmState, with_buffer_contents};
 
 use crate::acquire::AcquireGate;
+use crate::clipboard::{Bridge, Change, Offer};
 use crate::compose::{Compositor, Quad};
 use crate::input::Target;
 use crate::popup::{Parent, Popup, PopupId};
@@ -312,6 +315,9 @@ pub struct State {
     pub(crate) dmabuf_global: Option<DmabufGlobal>,
     pub(crate) data_device_state: DataDeviceState,
     pub(crate) primary_selection_state: PrimarySelectionState,
+    /// The desktop's clipboard, once a shell in a window has handed over
+    /// its connection ([`crate::Glasspane::bridge_clipboard`]).
+    pub(crate) clipboard: Option<Bridge>,
     pub(crate) seat_state: SeatState<Self>,
     /// The seat itself is driven through `keyboard` and `pointer`; it is held
     /// because dropping it destroys the `wl_seat` global.
@@ -1916,7 +1922,76 @@ impl SeatHandler for State {
 }
 
 impl SelectionHandler for State {
-    type SelectionUserData = ();
+    /// A selection this compositor sets itself is always the desktop's, and
+    /// what it carries is the desktop's offer, to read a paste from.
+    type SelectionUserData = Offer;
+
+    /// A tenant copied, or cleared its clipboard: the desktop is offered the
+    /// copy, or ours is withdrawn, when there is one. The primary selection
+    /// stays here.
+    fn new_selection(
+        &mut self,
+        ty: SelectionTarget,
+        source: Option<SelectionSource>,
+        _seat: Seat<Self>,
+    ) {
+        if let (SelectionTarget::Clipboard, Some(bridge)) = (ty, self.clipboard.as_mut()) {
+            match source {
+                Some(source) => bridge.offer(source.mime_types()),
+                None => bridge.withdraw(),
+            }
+        }
+    }
+
+    /// A tenant is pasting the desktop's clipboard.
+    ///
+    /// The bridge is checked for, not assumed: the offer is from the bridge
+    /// that set it, which a second [`crate::Glasspane::bridge_clipboard`]
+    /// can since have replaced.
+    fn send_selection(
+        &mut self,
+        ty: SelectionTarget,
+        mime_type: String,
+        fd: std::os::fd::OwnedFd,
+        _seat: Seat<Self>,
+        offer: &Offer,
+    ) {
+        if let (SelectionTarget::Clipboard, Some(bridge)) = (ty, self.clipboard.as_ref()) {
+            bridge.receive(offer, mime_type, fd);
+        }
+    }
+}
+
+impl State {
+    /// Act on what the desktop's clipboard said since the last turn: its
+    /// selection becomes the tenants', and a paste on the desktop of the
+    /// tenants' selection is handed to the tenant that copied.
+    pub(crate) fn pump_clipboard(&mut self) {
+        let Some(bridge) = self.clipboard.as_mut() else {
+            return;
+        };
+        for change in bridge.pump() {
+            match change {
+                Change::Offered(offer, mime_types) => {
+                    set_data_device_selection(&self.dh, &self.seat, mime_types, offer);
+                }
+                // An empty desktop clipboard empties the tenants' only if
+                // what they held was the desktop's; a tenant's own copy
+                // stands.
+                Change::Emptied => {
+                    let desktops = current_data_device_selection_userdata(&self.seat).is_some();
+                    if desktops {
+                        clear_data_device_selection(&self.dh, &self.seat);
+                    }
+                }
+                // Refused only when the tenant's selection has gone since;
+                // the pipe closes and the paste is empty.
+                Change::Wanted(mime_type, fd) => {
+                    let _ = request_data_device_client_selection(&self.seat, mime_type, fd);
+                }
+            }
+        }
+    }
 }
 
 impl DataDeviceHandler for State {

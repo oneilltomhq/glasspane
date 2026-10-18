@@ -801,6 +801,321 @@ fn a_clipboard_selection_crosses_between_tenants() {
     }
 }
 
+/// Turn two panes in step, so a transfer that crosses both (the bridge is a
+/// client of one and a compositor of the other) never waits on the pane not
+/// being turned.
+fn pump_both(
+    a: &mut Glasspane,
+    a_events: &mut Vec<Event>,
+    b: &mut Glasspane,
+    b_events: &mut Vec<Event>,
+    timeout: Duration,
+    mut done: impl FnMut(&[Event], &[Event]) -> bool,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        for (pane, events) in [(&mut *a, &mut *a_events), (&mut *b, &mut *b_events)] {
+            pane.dispatch(Some(Duration::from_millis(2))).unwrap();
+            pane.tick(Instant::now());
+            events.extend(pane.events());
+        }
+        if done(a_events, b_events) {
+            return true;
+        }
+    }
+    false
+}
+
+/// [`map_and_focus`] on `pane`, with `other` turning too.
+fn map_and_focus_both(
+    pane: &mut Glasspane,
+    events: &mut Vec<Event>,
+    other: &mut Glasspane,
+    other_events: &mut Vec<Event>,
+    what: &str,
+) -> TenantId {
+    let from = events.len();
+    let mut id = None;
+    pump_both(
+        pane,
+        events,
+        other,
+        other_events,
+        Duration::from_secs(10),
+        |evs, _| {
+            id = evs[from..].iter().find_map(|e| match e {
+                Event::Mapped { id, .. } => Some(*id),
+                _ => None,
+            });
+            id.is_some()
+        },
+    );
+    let id = id.unwrap_or_else(|| panic!("{what} never mapped a toplevel: {events:?}"));
+    pane.set_keyboard_focus(Some(id)).unwrap();
+    id
+}
+
+/// The fixture's connection as a window's display handle, the way winit's
+/// event loop hands over its own.
+struct WindowDisplay(std::ptr::NonNull<std::ffi::c_void>);
+
+impl raw_window_handle::HasDisplayHandle for WindowDisplay {
+    fn display_handle(
+        &self,
+    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+        let raw = raw_window_handle::WaylandDisplayHandle::new(self.0);
+        // SAFETY: the fixture's display lives as long as the fixture does,
+        // and this is made and dropped while it runs.
+        Ok(unsafe {
+            raw_window_handle::DisplayHandle::borrow_raw(
+                raw_window_handle::RawDisplayHandle::Wayland(raw),
+            )
+        })
+    }
+}
+
+/// A desktop with the shell's window on it, and the shell's pane bridged to
+/// the desktop's clipboard through that window's connection.
+///
+/// The desktop is a second glasspane: its clipboard is smithay's, which, like
+/// a real desktop's, offers the selection only to the client with the
+/// keyboard and takes one only from it. The window is the fixture, a client
+/// of the desktop the way winit's window is, and the shell's pane gets its
+/// `wl_display`, as `nested.rs` would hand over winit's.
+///
+/// Fields drop in order: the shell's pane goes first, because the bridge
+/// gives its objects back on the window's connection and so must go while
+/// that connection is open; then the window; then the desktop.
+struct Bridged {
+    nest: Glasspane,
+    nest_events: Vec<Event>,
+    _window: Fixture,
+    window_id: TenantId,
+    desk: Glasspane,
+    desk_events: Vec<Event>,
+    copy: std::path::PathBuf,
+    paste: std::path::PathBuf,
+    children: Vec<std::process::Child>,
+}
+
+impl Bridged {
+    fn start(tag: &str) -> Option<Self> {
+        let (copy, paste) = wl_clipboard()?;
+        let (_adapter, device, queue) = gpu()?;
+        let mut desk = start(&format!("{tag}-desk"), None, device.clone(), queue.clone());
+        let mut nest = start(&format!("{tag}-nest"), None, device, queue);
+        let mut desk_events = Vec::new();
+        let (window, id) = map_tenant(&mut desk, Transport::Shm, &mut desk_events);
+        let Report::Display(display) =
+            window.expect(Duration::from_secs(1), |r| matches!(r, Report::Display(_)))
+        else {
+            unreachable!()
+        };
+        let display = std::ptr::NonNull::new(display as *mut std::ffi::c_void).expect("a display");
+        // SAFETY: the fixture's connection lives until `window` drops, and
+        // `nest` drops before it (the field order of `Bridged`).
+        unsafe { nest.bridge_clipboard(&WindowDisplay(display)) }.expect("bridge");
+        let mut b = Bridged {
+            nest,
+            nest_events: Vec::new(),
+            _window: window,
+            window_id: id,
+            desk,
+            desk_events,
+            copy,
+            paste,
+            children: Vec::new(),
+        };
+        // Long enough for the bridge to hear the seat has a keyboard and
+        // make one, so the window's focus reaches it as an `enter`.
+        b.turn(Duration::from_millis(300), |_, _| false);
+        b.desk.set_keyboard_focus(Some(id)).unwrap();
+        Some(b)
+    }
+
+    fn turn(&mut self, timeout: Duration, done: impl FnMut(&[Event], &[Event]) -> bool) -> bool {
+        pump_both(
+            &mut self.desk,
+            &mut self.desk_events,
+            &mut self.nest,
+            &mut self.nest_events,
+            timeout,
+            done,
+        )
+    }
+
+    /// The desktop pane, or the shell's, and the other one.
+    fn panes(
+        &mut self,
+        on_desk: bool,
+    ) -> (
+        &mut Glasspane,
+        &mut Vec<Event>,
+        &mut Glasspane,
+        &mut Vec<Event>,
+    ) {
+        if on_desk {
+            (
+                &mut self.desk,
+                &mut self.desk_events,
+                &mut self.nest,
+                &mut self.nest_events,
+            )
+        } else {
+            (
+                &mut self.nest,
+                &mut self.nest_events,
+                &mut self.desk,
+                &mut self.desk_events,
+            )
+        }
+    }
+
+    /// wl-copy `text` on one side, and wait until it has set the selection
+    /// and unmapped. It stays running: its source is what serves the paste.
+    fn copy(&mut self, on_desk: bool, text: &str) {
+        let program = self.copy.clone();
+        let (pane, events, other, other_events) = self.panes(on_desk);
+        let copier = wl_clipboard_command(&program, pane)
+            .arg("--foreground")
+            .arg(text)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn wl-copy");
+        let id = map_and_focus_both(pane, events, other, other_events, "wl-copy");
+        let gone = pump_both(
+            pane,
+            events,
+            other,
+            other_events,
+            Duration::from_secs(5),
+            |evs, _| {
+                evs.iter()
+                    .any(|e| matches!(e, Event::Unmapped { id: u } if *u == id))
+            },
+        );
+        assert!(gone, "wl-copy never unmapped: {events:?}");
+        self.children.push(copier);
+    }
+
+    /// wl-paste on one side, and what it printed, or `None` if it printed
+    /// nothing in 10 s.
+    fn paste(&mut self, on_desk: bool) -> Option<String> {
+        let program = self.paste.clone();
+        let (pane, events, other, other_events) = self.panes(on_desk);
+        let mut paster = wl_clipboard_command(&program, pane)
+            .arg("--no-newline")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn wl-paste");
+        let mut out = paster.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = std::io::Read::read_to_string(&mut out, &mut s);
+            let _ = tx.send(s);
+        });
+        map_and_focus_both(pane, events, other, other_events, "wl-paste");
+        let mut got = None;
+        pump_both(
+            pane,
+            events,
+            other,
+            other_events,
+            Duration::from_secs(10),
+            |_, _| {
+                got = rx.try_recv().ok();
+                got.is_some()
+            },
+        );
+        self.children.push(paster);
+        got
+    }
+}
+
+impl Drop for Bridged {
+    fn drop(&mut self) {
+        for child in &mut self.children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// **A copy on the desktop pastes into a tenant.**
+///
+/// wl-copy owns the desktop's clipboard; the window is given the desktop's
+/// keyboard, which is when a desktop offers a window its clipboard; and
+/// wl-paste, a tenant of the shell's pane, is offered it and reads it. The
+/// bytes go from wl-copy to wl-paste through both compositors, by the
+/// tenant's own pipe.
+#[test]
+fn a_desktop_copy_pastes_into_a_tenant() {
+    let Some(mut b) = Bridged::start("from-desk") else {
+        return;
+    };
+    b.copy(true, "hunter2");
+    // wl-copy took the desktop's keyboard; the window has it back.
+    let window = b.window_id;
+    b.desk.set_keyboard_focus(Some(window)).unwrap();
+    let got = b.paste(false);
+    assert_eq!(
+        got.as_deref(),
+        Some("hunter2"),
+        "desktop {:?}; pane {:?}",
+        b.desk_events,
+        b.nest_events
+    );
+}
+
+/// **A copy in a tenant pastes on the desktop**, while the window has the
+/// desktop's keyboard, which is when a desktop takes a selection from it.
+#[test]
+fn a_tenant_copy_pastes_on_the_desktop() {
+    let Some(mut b) = Bridged::start("to-desk") else {
+        return;
+    };
+    b.copy(false, "from a pane");
+    let got = b.paste(true);
+    assert_eq!(
+        got.as_deref(),
+        Some("from a pane"),
+        "desktop {:?}; pane {:?}",
+        b.desk_events,
+        b.nest_events
+    );
+}
+
+/// **A copy in a tenant made while the window is unfocused pastes on the
+/// desktop once the window has the keyboard again.**
+///
+/// The desktop refuses a selection set with a serial from before the
+/// window's leave, so the copy waits for the window's next enter, and is
+/// offered with that serial.
+#[test]
+fn an_unfocused_tenant_copy_pastes_on_the_desktop_after_focus() {
+    let Some(mut b) = Bridged::start("away") else {
+        return;
+    };
+    b.desk.set_keyboard_focus(None).unwrap();
+    // Long enough for the bridge to hear the window's enter, then its leave.
+    b.turn(Duration::from_millis(300), |_, _| false);
+    b.copy(false, "copied while away");
+    let window = b.window_id;
+    b.desk.set_keyboard_focus(Some(window)).unwrap();
+    // And for it to hear the enter, and offer the copy with its serial,
+    // before wl-paste takes the keyboard.
+    b.turn(Duration::from_millis(300), |_, _| false);
+    let got = b.paste(true);
+    assert_eq!(
+        got.as_deref(),
+        Some("copied while away"),
+        "desktop {:?}; pane {:?}",
+        b.desk_events,
+        b.nest_events
+    );
+}
+
 /// `foot` on `PATH`, or `None`, saying so.
 fn foot() -> Option<std::path::PathBuf> {
     let found = std::env::var_os("PATH").and_then(|paths| {

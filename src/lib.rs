@@ -96,6 +96,7 @@
 #![doc(html_root_url = "https://docs.rs/glasspane/0.1.0")]
 
 pub mod acquire;
+mod clipboard;
 mod compose;
 mod convert;
 mod error;
@@ -123,6 +124,8 @@ use std::ffi::OsString;
 use std::process::{Child, Command};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
 
 use smithay::input::keyboard::XkbConfig;
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel};
@@ -434,6 +437,7 @@ impl Glasspane {
             dmabuf_global,
             data_device_state,
             primary_selection_state,
+            clipboard: None,
             seat_state,
             seat,
             keyboard,
@@ -531,7 +535,54 @@ impl Glasspane {
         // Trees whose surfaces committed in this turn are drawn once, now,
         // with every surface's state of this turn applied.
         self.state.compose_trees();
+        self.state.pump_clipboard();
         self.state.flush();
+        Ok(())
+    }
+
+    /// **Share the desktop's clipboard with the tenants**, both ways, for a
+    /// shell that is a window on a Wayland desktop.
+    ///
+    /// `window` holds the window's own connection to the desktop: with winit,
+    /// the event loop or the window itself, by [`HasDisplayHandle`]. A handle
+    /// that is not [`RawDisplayHandle::Wayland`] (winit on X11) is
+    /// [`Error::Clipboard`], and the bridge, if there was one, stays. From
+    /// then on what the desktop's clipboard holds is offered to
+    /// the tenant with the keyboard, and what a tenant copies is offered on
+    /// the desktop, carried on through [`Glasspane::dispatch`]. The contents
+    /// are never read here: a paste is a pipe from whoever copied straight to
+    /// whoever pastes.
+    ///
+    /// It has to be the window's connection. A desktop offers its clipboard
+    /// only to the client with its keyboard, so the desktop's copy reaches the
+    /// tenants when the window gains focus, and a tenant's copy reaches the
+    /// desktop while the window has it, or when it next does. Only the
+    /// clipboard: the primary
+    /// selection stays between tenants. A shell with no window does not call
+    /// this, and nothing about the tenants' own clipboard changes. A second
+    /// call replaces the first.
+    ///
+    /// # Safety
+    ///
+    /// The `wl_display` behind `window`'s handle must stay live for as long
+    /// as this `Glasspane` does: drop the `Glasspane` before the connection
+    /// closes (with winit, before the event loop). The handle's borrow ends
+    /// with this call and promises nothing past it; the bridge keeps the
+    /// display.
+    pub unsafe fn bridge_clipboard(&mut self, window: &impl HasDisplayHandle) -> Result<()> {
+        let handle = window
+            .display_handle()
+            .map_err(|e| Error::Clipboard(e.to_string()))?;
+        let RawDisplayHandle::Wayland(wayland) = handle.as_raw() else {
+            return Err(Error::Clipboard(format!(
+                "not a Wayland display: {:?}",
+                handle.as_raw()
+            )));
+        };
+        // The old bridge gives its objects back before the new one asks.
+        self.state.clipboard = None;
+        // SAFETY: the caller's.
+        self.state.clipboard = Some(unsafe { clipboard::Bridge::new(wayland.display) });
         Ok(())
     }
 

@@ -58,6 +58,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the texture format stays one for every tenant. Android's gralloc allocates
   nothing else, and Waydroid's hwcomposer was disconnected with
   `invalid_format` on its first frame, over and over. `wl_shm` is unchanged.
+- `Glasspane::bridge_clipboard`: bridge the clipboard between the desktop
+  and the tenants, for a shell that is itself a Wayland client of the
+  desktop. Handed the shell window's display handle
+  (`raw_window_handle::HasDisplayHandle`, a Wayland one), glasspane opens
+  its own event queue on that connection and its own `wl_data_device` on
+  the window's seat, so the desktop sees the window copying and pasting, and
+  needs no extra protocol (GNOME has no data-control). Both directions are
+  lazy: the desktop's offer is set as the tenants' selection, a tenant's
+  copy becomes the window's selection (on the window's next focus, if it is
+  copied while the window has none), and a paste is a pipe passed through
+  untouched. Only the clipboard; the primary selection stays between
+  tenants. Headless, nothing calls it and nothing changes.
+- `Error::Clipboard`, for a display handle that is not a Wayland one.
 
 ### Changed
 
