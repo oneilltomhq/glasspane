@@ -110,7 +110,7 @@ pub mod texture;
 
 pub use acquire::AcquireReport;
 pub use error::{Error, Result};
-pub use event::Event;
+pub use event::{Event, Selection};
 pub use input::{KeyState, Target};
 pub use popup::{Parent, Popup, PopupId};
 pub use tenant::{Tenant, TenantId};
@@ -288,17 +288,16 @@ impl Glasspane {
         let shm_state = ShmState::new::<State>(&dh, vec![]);
         let data_device_state = DataDeviceState::new::<State>(&dh);
         let primary_selection_state = PrimarySelectionState::new::<State>(&dh);
-        // Both carry the primary selection too, and both are open to every
-        // client: `State::ext_data_control_state` says why.
+        // Both carry the primary selection too.
         let ext_data_control_state = ext_data_control::DataControlState::new::<State, _>(
             &dh,
             Some(&primary_selection_state),
-            |_| true,
+            every_tenant,
         );
         let wlr_data_control_state = wlr_data_control::DataControlState::new::<State, _>(
             &dh,
             Some(&primary_selection_state),
-            |_| true,
+            every_tenant,
         );
         let mut dmabuf_state = DmabufState::new();
 
@@ -830,6 +829,18 @@ impl Drop for Glasspane {
             gate.shutdown();
         }
     }
+}
+
+/// Who may bind the data-control globals: everyone.
+///
+/// Every client on glasspane's socket is the shell's own tenant, so there is
+/// no stranger to keep out. A data-control client reads and sets the
+/// clipboard and the primary selection without keyboard focus, and that is
+/// the point: a clipboard tool, or Claude Code's paste, run from a terminal
+/// pane has no surface the shell will ever focus (#14). sway, niri and cosmic
+/// allow it the same way.
+fn every_tenant(_: &smithay::reexports::wayland_server::Client) -> bool {
+    true
 }
 
 /// The client's pid, from `SO_PEERCRED`.

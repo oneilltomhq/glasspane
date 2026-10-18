@@ -194,7 +194,8 @@ selection follows keyboard focus, so a tenant is offered it once it has the
 keyboard.
 Data control (`ext_data_control_manager_v1` and `zwlr_data_control_manager_v1`)
 reads and sets both without focus, so `wl-copy`, `wl-paste` and clipboard
-managers work from any tenant.
+managers work from any tenant. Each set is announced as
+`Event::SelectionChanged`, saying which selection and nothing else.
 
 A shell that is itself a Wayland window can hand glasspane its `wl_display`
 with `Glasspane::bridge_clipboard`, and the clipboard then crosses to and from

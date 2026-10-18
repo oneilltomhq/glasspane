@@ -66,7 +66,7 @@ use crate::popup::{Parent, Popup, PopupId};
 use crate::registry::{BufferKey, Registry};
 use crate::tenant::{Tenant, TenantId};
 use crate::texture::Skin;
-use crate::{texture, Event};
+use crate::{texture, Event, Selection};
 
 /// Which of the two lists a commit, a texture or an input event is about.
 ///
@@ -319,17 +319,12 @@ pub struct State {
     /// The desktop's clipboard, once a shell in a window has handed over
     /// its connection ([`crate::Glasspane::bridge_clipboard`]).
     pub(crate) clipboard: Option<Bridge>,
-    /// `ext_data_control_manager_v1`. A data-control client reads and sets
-    /// the clipboard and the primary selection without keyboard focus, and
-    /// that is the point: a `wl-paste` run from a terminal has no surface
-    /// the shell will ever focus, and without data control it maps an
-    /// invisible toplevel and waits for focus for ever (Claude Code's ctrl+v
-    /// hung on "Pasting..." that way, #14). Every client may bind it, as on
-    /// sway, niri and cosmic: every client on this socket is the shell's own
-    /// tenant, so there is no stranger to keep out.
+    /// `ext_data_control_manager_v1`, held only for its handler trait to
+    /// hand back; who may bind it is `every_tenant` in lib.rs.
     pub(crate) ext_data_control_state: ext_data_control::DataControlState,
     /// `zwlr_data_control_manager_v1`, the protocol the ext one replaces and
     /// the only one wl-clipboard 2.2.1 and most clipboard managers speak.
+    /// Held the same way.
     pub(crate) wlr_data_control_state: wlr_data_control::DataControlState,
     pub(crate) seat_state: SeatState<Self>,
     /// The seat itself is driven through `keyboard` and `pointer`; it is held
@@ -1939,15 +1934,23 @@ impl SelectionHandler for State {
     /// what it carries is the desktop's offer, to read a paste from.
     type SelectionUserData = Offer;
 
-    /// A tenant copied, or cleared its clipboard: the desktop is offered the
-    /// copy, or ours is withdrawn, when there is one. The primary selection
-    /// stays here.
+    /// A tenant copied, or cleared a selection, over its data device or
+    /// data control: the shell is told which, and for the clipboard the
+    /// desktop is offered the copy, or ours is withdrawn, when there is one.
+    /// The primary selection stays here. Smithay stores the selection right
+    /// after this returns, so by the time the shell drains the event a paste
+    /// gets it.
     fn new_selection(
         &mut self,
         ty: SelectionTarget,
         source: Option<SelectionSource>,
         _seat: Seat<Self>,
     ) {
+        let selection = match ty {
+            SelectionTarget::Clipboard => Selection::Clipboard,
+            SelectionTarget::Primary => Selection::Primary,
+        };
+        self.emit(Event::SelectionChanged { selection });
         if let (SelectionTarget::Clipboard, Some(bridge)) = (ty, self.clipboard.as_mut()) {
             match source {
                 Some(source) => bridge.offer(source.mime_types()),

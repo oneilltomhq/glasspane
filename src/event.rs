@@ -130,6 +130,19 @@ pub enum Event {
         /// The popup that left.
         id: PopupId,
     },
+    /// A tenant copied or cleared a selection, over its data device or over
+    /// data control.
+    ///
+    /// Only which selection: the mime types and the source stay with the
+    /// seat. A shell can show a clipboard indicator from it. It fires once
+    /// per set, never per frame. A selection that goes because the tenant
+    /// that owned it quit fires nothing; the next paste is told it is empty.
+    /// Nor does the desktop's clipboard arriving through
+    /// [`crate::Glasspane::bridge_clipboard`]: that is no tenant's copy.
+    SelectionChanged {
+        /// The clipboard or the primary selection.
+        selection: Selection,
+    },
     /// A commit was refused and dropped. The client is still connected.
     ///
     /// Loud on purpose: the alternative is a tenant that keeps compositing at
@@ -140,4 +153,14 @@ pub enum Event {
         /// Why.
         why: String,
     },
+}
+
+/// Which of the seat's two selections an [`Event::SelectionChanged`] is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Selection {
+    /// The clipboard: copy and paste, `wl_data_device`.
+    Clipboard,
+    /// The primary selection: select and middle-click,
+    /// `zwp_primary_selection_device_v1`.
+    Primary,
 }
