@@ -35,6 +35,13 @@
 //!   and the desktop's `send` is forwarded to the tenant's source with the
 //!   desktop's pipe.
 //!
+//! A tenant's copy made while the window does not have the keyboard waits
+//! for it. The desktop would refuse it now: a serial from before the window's
+//! last leave is stale. So it is held, and offered on the window's next enter,
+//! unless a later tenant copy or clear replaces it first. Held, it also beats
+//! the desktop's own selection, which a desktop sends just before that enter
+//! and which predates the copy.
+//!
 //! A selection of ours comes back: the desktop offers it to the focused
 //! client, which is the window. It is known by a marker mime type and
 //! ignored; taken, a tenant's copy would replace itself with a desktop offer
@@ -68,10 +75,14 @@ use wayland_client::{
 pub struct Offer(WlDataOffer);
 
 /// What the desktop said that the tenants' side has to act on.
+///
+/// The seam between the desktop's dispatch, which has no seat, and the
+/// tenants' seat, which [`crate::state::State`] holds.
 pub(crate) enum Change {
-    /// The desktop's clipboard is now this offer, with these mime types, or
-    /// is empty.
-    Offered(Option<(Offer, Vec<String>)>),
+    /// The desktop's clipboard is now this offer, with these mime types.
+    Offered(Offer, Vec<String>),
+    /// The desktop's clipboard is empty.
+    Emptied,
     /// Something on the desktop is pasting the tenants' selection: write it
     /// as this mime type into this pipe.
     Wanted(String, OwnedFd),
@@ -88,6 +99,7 @@ impl std::fmt::Debug for Bridge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Bridge")
             .field("serial", &self.desk.serial)
+            .field("pending", &self.desk.pending)
             .field("offer", &self.desk.offer.is_some())
             .field("source", &self.desk.source.is_some())
             .finish_non_exhaustive()
@@ -105,7 +117,14 @@ struct Desk {
     /// serials: a desktop takes a selection with the serial of the window's
     /// latest input, and the window's keyboard objects are winit's.
     keyboard: Option<WlKeyboard>,
+    /// The serial of the window's latest enter, key or modifiers, and `None`
+    /// from its leave: a serial from before a leave is stale, and a desktop
+    /// refuses a selection set with it.
     serial: Option<u32>,
+    /// A tenant's copy made with no serial to offer it with: its mime types,
+    /// offered on the window's next enter. A later tenant copy or clear
+    /// replaces it, and while it waits the desktop's selection is not taken.
+    pending: Option<Vec<String>>,
     /// The desktop's current selection as last offered, destroyed when the
     /// next one comes, as the protocol asks.
     offer: Option<WlDataOffer>,
@@ -121,23 +140,22 @@ struct Desk {
 impl Bridge {
     /// Ask the desktop for its globals on `display`.
     ///
+    /// The request is only queued, and goes out on the first [`Bridge::pump`].
     /// Nothing waits for the answer: the seat and the data device manager are
-    /// bound when the registry names them, in a later [`Bridge::pump`]. A
-    /// roundtrip here would block the window's thread on the desktop, and
-    /// whoever is the desktop may be served from that same thread.
+    /// bound when the registry names them, in a later pump. A roundtrip here
+    /// would block the window's thread on the desktop, and whoever is the
+    /// desktop may be served from that same thread.
     ///
     /// # Safety
     ///
     /// `display` is a live `wl_display`, and outlives the bridge.
-    pub(crate) unsafe fn new(display: NonNull<c_void>) -> Result<Self, String> {
+    pub(crate) unsafe fn new(display: NonNull<c_void>) -> Self {
         // SAFETY: the caller's.
         let backend = unsafe { Backend::from_foreign_display(display.as_ptr().cast()) };
         let conn = Connection::from_backend(backend);
         let queue = conn.new_event_queue();
         let qh = queue.handle();
         conn.display().get_registry(&qh, ());
-        conn.flush()
-            .map_err(|e| format!("the desktop's registry: {e}"))?;
         let desk = Desk {
             qh,
             seat: None,
@@ -145,15 +163,22 @@ impl Bridge {
             device: None,
             keyboard: None,
             serial: None,
+            pending: None,
             offer: None,
             source: None,
             marker: format!("application/x-glasspane-{}", std::process::id()),
             changes: Vec::new(),
         };
-        Ok(Bridge { conn, queue, desk })
+        Bridge { conn, queue, desk }
     }
 
-    /// Take in what the desktop has said since the last call.
+    /// Write what the tenants' side has asked of the desktop, and take in
+    /// what the desktop has said since the last call.
+    ///
+    /// The one place the bridge writes the window's connection (bar its
+    /// drop). [`Bridge::offer`], [`Bridge::withdraw`], [`Bridge::receive`]
+    /// and the dispatch here only queue requests, and the flushes before the
+    /// read and after the dispatch send them, in order.
     ///
     /// The socket is read here too, without blocking, when it has something.
     /// The window's own loop reads it as well, and libwayland sorts each
@@ -177,53 +202,43 @@ impl Bridge {
         std::mem::take(&mut self.desk.changes)
     }
 
-    /// A tenant set the selection to these mime types, or cleared it: offer
-    /// it on the desktop, or withdraw ours.
+    /// A tenant copied these mime types: offer them on the desktop, now if
+    /// the window has the keyboard, or on its next enter.
+    pub(crate) fn offer(&mut self, mime_types: Vec<String>) {
+        self.desk.offer(mime_types);
+    }
+
+    /// A tenant cleared its clipboard: withdraw ours from the desktop, and
+    /// forget a copy still waiting for the keyboard.
     ///
-    /// Without a serial the window has never had the keyboard, and a desktop
-    /// would refuse the selection anyway.
-    pub(crate) fn offer(&mut self, mime_types: Option<Vec<String>>) {
+    /// Only ours: a tenant clearing its clipboard is not a reason to empty
+    /// the desktop's. Without a serial ours stays offered, and a paste of it
+    /// finds the tenants' clipboard empty.
+    pub(crate) fn withdraw(&mut self) {
         let desk = &mut self.desk;
-        let (Some(serial), Some(device), Some(manager)) =
-            (desk.serial, &desk.device, &desk.manager)
-        else {
+        desk.pending = None;
+        let (Some(serial), Some(device)) = (desk.serial, &desk.device) else {
             return;
         };
-        let old = desk.source.take();
-        match mime_types {
-            Some(mime_types) => {
-                let source = manager.create_data_source(&desk.qh, ());
-                for mime_type in mime_types {
-                    source.offer(mime_type);
-                }
-                source.offer(desk.marker.clone());
-                device.set_selection(Some(&source), serial);
-                desk.source = Some(source);
-            }
-            // Only ours is withdrawn: a tenant clearing its clipboard is not
-            // a reason to empty the desktop's.
-            None if old.is_some() => device.set_selection(None, serial),
-            None => {}
-        }
-        if let Some(old) = old {
+        if let Some(old) = desk.source.take() {
+            device.set_selection(None, serial);
             old.destroy();
         }
-        let _ = self.conn.flush();
     }
 
     /// A tenant is pasting the desktop's selection: hand its pipe to the
     /// desktop's offer, which hands it to whoever copied.
     pub(crate) fn receive(&self, offer: &Offer, mime_type: String, fd: OwnedFd) {
-        // libwayland duplicates the fd as the request is written, so the
+        // libwayland duplicates the fd as the request is queued, so the
         // tenant's copy closes here and the desktop's when it is done.
         offer.0.receive(mime_type, fd.as_fd());
-        let _ = self.conn.flush();
     }
 }
 
 impl Drop for Bridge {
     /// Everything on the desktop is given back before the queue goes: the
-    /// connection is the window's and outlives the bridge.
+    /// connection is the window's and outlives the bridge. The one flush
+    /// outside [`Bridge::pump`], since no pump follows.
     fn drop(&mut self) {
         let desk = &mut self.desk;
         if let Some(source) = desk.source.take() {
@@ -252,13 +267,46 @@ impl Drop for Bridge {
 }
 
 impl Desk {
+    /// Offer a tenant's copy on the desktop as the window's selection, or,
+    /// with no serial to set it with, hold it for the next enter.
+    fn offer(&mut self, mime_types: Vec<String>) {
+        let (Some(serial), Some(device), Some(manager)) =
+            (self.serial, &self.device, &self.manager)
+        else {
+            self.pending = Some(mime_types);
+            return;
+        };
+        self.pending = None;
+        let source = manager.create_data_source(&self.qh, ());
+        for mime_type in mime_types {
+            source.offer(mime_type);
+        }
+        source.offer(self.marker.clone());
+        device.set_selection(Some(&source), serial);
+        if let Some(old) = self.source.replace(source) {
+            old.destroy();
+        }
+    }
+
     /// The desktop's selection changed, or was offered again on focus-in.
+    ///
+    /// Not taken while a tenant's copy is pending: the desktop sends its
+    /// selection just before the enter that offers the copy, and the copy is
+    /// newer. A desktop that sends it after the enter instead (smithay does)
+    /// is not covered: by then the copy has been offered and is no longer
+    /// pending, and a selection the desktop held is taken over it.
     fn selected(&mut self, offer: Option<WlDataOffer>) {
         if let Some(old) = self.offer.take() {
             old.destroy();
         }
+        if self.pending.is_some() {
+            if let Some(offer) = offer {
+                offer.destroy();
+            }
+            return;
+        }
         let Some(offer) = offer else {
-            self.changes.push(Change::Offered(None));
+            self.changes.push(Change::Emptied);
             return;
         };
         let mime_types = offer
@@ -270,8 +318,7 @@ impl Desk {
             return;
         }
         self.offer = Some(offer.clone());
-        self.changes
-            .push(Change::Offered(Some((Offer(offer), mime_types))));
+        self.changes.push(Change::Offered(Offer(offer), mime_types));
     }
 }
 
@@ -335,9 +382,15 @@ impl Dispatch<WlKeyboard, ()> for Desk {
         _: &QueueHandle<Self>,
     ) {
         match event {
-            wl_keyboard::Event::Enter { serial, .. }
-            | wl_keyboard::Event::Key { serial, .. }
+            wl_keyboard::Event::Enter { serial, .. } => {
+                desk.serial = Some(serial);
+                if let Some(mime_types) = desk.pending.take() {
+                    desk.offer(mime_types);
+                }
+            }
+            wl_keyboard::Event::Key { serial, .. }
             | wl_keyboard::Event::Modifiers { serial, .. } => desk.serial = Some(serial),
+            wl_keyboard::Event::Leave { .. } => desk.serial = None,
             // The keymap's fd is dropped, and closed, with the event.
             _ => {}
         }

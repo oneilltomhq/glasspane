@@ -1923,8 +1923,9 @@ impl SelectionHandler for State {
     /// what it carries is the desktop's offer, to read a paste from.
     type SelectionUserData = Offer;
 
-    /// A tenant copied, or cleared its clipboard: the desktop is told, when
-    /// there is one. The primary selection stays here.
+    /// A tenant copied, or cleared its clipboard: the desktop is offered the
+    /// copy, or ours is withdrawn, when there is one. The primary selection
+    /// stays here.
     fn new_selection(
         &mut self,
         ty: SelectionTarget,
@@ -1932,11 +1933,18 @@ impl SelectionHandler for State {
         _seat: Seat<Self>,
     ) {
         if let (SelectionTarget::Clipboard, Some(bridge)) = (ty, self.clipboard.as_mut()) {
-            bridge.offer(source.map(|s| s.mime_types()));
+            match source {
+                Some(source) => bridge.offer(source.mime_types()),
+                None => bridge.withdraw(),
+            }
         }
     }
 
     /// A tenant is pasting the desktop's clipboard.
+    ///
+    /// The bridge is checked for, not assumed: the offer is from the bridge
+    /// that set it, which a second [`crate::Glasspane::bridge_clipboard`]
+    /// can since have replaced.
     fn send_selection(
         &mut self,
         ty: SelectionTarget,
@@ -1961,13 +1969,13 @@ impl State {
         };
         for change in bridge.pump() {
             match change {
-                Change::Offered(Some((offer, mime_types))) => {
+                Change::Offered(offer, mime_types) => {
                     set_data_device_selection(&self.dh, &self.seat, mime_types, offer);
                 }
                 // An empty desktop clipboard empties the tenants' only if
                 // what they held was the desktop's; a tenant's own copy
                 // stands.
-                Change::Offered(None) => {
+                Change::Emptied => {
                     let desktops = current_data_device_selection_userdata(&self.seat).is_some();
                     if desktops {
                         clear_data_device_selection(&self.dh, &self.seat);

@@ -35,8 +35,8 @@ pub enum Error {
     /// A scale that is not a finite number above zero. See
     /// [`crate::Glasspane::set_scale`].
     BadScale(f64),
-    /// The desktop's clipboard could not be reached on the connection given
-    /// to [`crate::Glasspane::bridge_clipboard`].
+    /// The display handle given to [`crate::Glasspane::bridge_clipboard`]
+    /// is not a Wayland one, or could not be had.
     Clipboard(String),
 }
 

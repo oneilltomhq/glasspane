@@ -30,6 +30,9 @@ tracing = "0.1"
 # headless caller needs no libwayland-client to build or to run.
 wayland-client = "0.31"
 wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
+# How the shell hands over that connection: its window's display handle. The
+# version wgpu (and winit) already hold.
+raw-window-handle = "0.6"
 
 [dependencies.smithay]
 version = "0.7"

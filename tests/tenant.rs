@@ -723,6 +723,25 @@ fn map_and_focus_both(
     id
 }
 
+/// The fixture's connection as a window's display handle, the way winit's
+/// event loop hands over its own.
+struct WindowDisplay(std::ptr::NonNull<std::ffi::c_void>);
+
+impl raw_window_handle::HasDisplayHandle for WindowDisplay {
+    fn display_handle(
+        &self,
+    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+        let raw = raw_window_handle::WaylandDisplayHandle::new(self.0);
+        // SAFETY: the fixture's display lives as long as the fixture does,
+        // and this is made and dropped while it runs.
+        Ok(unsafe {
+            raw_window_handle::DisplayHandle::borrow_raw(
+                raw_window_handle::RawDisplayHandle::Wayland(raw),
+            )
+        })
+    }
+}
+
 /// A desktop with the shell's window on it, and the shell's pane bridged to
 /// the desktop's clipboard through that window's connection.
 ///
@@ -763,7 +782,7 @@ impl Bridged {
         let display = std::ptr::NonNull::new(display as *mut std::ffi::c_void).expect("a display");
         // SAFETY: the fixture's connection lives until `window` drops, and
         // `nest` drops before it (the field order of `Bridged`).
-        unsafe { nest.bridge_clipboard(display) }.expect("bridge");
+        unsafe { nest.bridge_clipboard(&WindowDisplay(display)) }.expect("bridge");
         let mut b = Bridged {
             nest,
             nest_events: Vec::new(),
@@ -929,6 +948,36 @@ fn a_tenant_copy_pastes_on_the_desktop() {
     assert_eq!(
         got.as_deref(),
         Some("from a pane"),
+        "desktop {:?}; pane {:?}",
+        b.desk_events,
+        b.nest_events
+    );
+}
+
+/// **A copy in a tenant made while the window is unfocused pastes on the
+/// desktop once the window has the keyboard again.**
+///
+/// The desktop refuses a selection set with a serial from before the
+/// window's leave, so the copy waits for the window's next enter, and is
+/// offered with that serial.
+#[test]
+fn an_unfocused_tenant_copy_pastes_on_the_desktop_after_focus() {
+    let Some(mut b) = Bridged::start("away") else {
+        return;
+    };
+    b.desk.set_keyboard_focus(None).unwrap();
+    // Long enough for the bridge to hear the window's enter, then its leave.
+    b.turn(Duration::from_millis(300), |_, _| false);
+    b.copy(false, "copied while away");
+    let window = b.window_id;
+    b.desk.set_keyboard_focus(Some(window)).unwrap();
+    // And for it to hear the enter, and offer the copy with its serial,
+    // before wl-paste takes the keyboard.
+    b.turn(Duration::from_millis(300), |_, _| false);
+    let got = b.paste(true);
+    assert_eq!(
+        got.as_deref(),
+        Some("copied while away"),
         "desktop {:?}; pane {:?}",
         b.desk_events,
         b.nest_events
