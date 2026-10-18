@@ -242,6 +242,9 @@ pub struct Glasspane {
     event_loop: EventLoop<'static, State>,
     state: State,
     socket_name: OsString,
+    /// What the dma-buf global's default feedback names; see
+    /// [`Glasspane::dmabuf_main_device`].
+    dmabuf_main_device: Option<libc::dev_t>,
 }
 
 impl std::fmt::Debug for Glasspane {
@@ -300,29 +303,40 @@ impl Glasspane {
                 None
             }
         };
-        let fenced = acquire.is_some();
         // With a render node the global is v4 and up, and its default
         // feedback names that node as the main device. That is not optional
         // for GL clients: Mesa's EGL takes its GPU from `main_device` and
         // nowhere else, so on a v3 global Ghostty rendered on llvmpipe. With
-        // no node (a software adapter) the v3 global is the honest answer.
-        let mut dmabuf_main_device = None;
-        let dmabuf_global = match caps.adapter {
-            Some(adapter) if fenced || caps.allow_unfenced_dmabuf => {
+        // no node (a software adapter) the v3 global is the honest answer, and
+        // a query that fails gets the same: it costs GL clients the GPU, not
+        // the compositor its start.
+        let (dmabuf_global, dmabuf_main_device) = match caps.adapter {
+            Some(adapter) => {
                 let formats = shareable_formats(adapter)?;
                 if formats.is_empty() {
-                    None
-                } else if let Some(node) = wgpu_dmabuf::device::render_node(adapter)? {
-                    let feedback = DmabufFeedbackBuilder::new(node, formats)
-                        .build()
-                        .map_err(|e| Error::Device(format!("dma-buf feedback: {e}")))?;
-                    dmabuf_main_device = Some(node);
-                    Some(dmabuf_state.create_global_with_default_feedback::<State>(&dh, &feedback))
+                    (None, None)
                 } else {
-                    Some(dmabuf_state.create_global::<State>(&dh, formats))
+                    let node = wgpu_dmabuf::device::render_node(adapter).unwrap_or_else(|e| {
+                        tracing::warn!("dma-buf global is v3, the render node query failed: {e}");
+                        None
+                    });
+                    match node {
+                        Some(node) => {
+                            let feedback = DmabufFeedbackBuilder::new(node, formats)
+                                .build()
+                                .map_err(|e| Error::Device(format!("dma-buf feedback: {e}")))?;
+                            let global = dmabuf_state
+                                .create_global_with_default_feedback::<State>(&dh, &feedback);
+                            (Some(global), Some(node))
+                        }
+                        None => (
+                            Some(dmabuf_state.create_global::<State>(&dh, formats)),
+                            None,
+                        ),
+                    }
                 }
             }
-            _ => None,
+            None => (None, None),
         };
 
         // One output, sized to the default tenant size. It exists because a
@@ -418,7 +432,6 @@ impl Glasspane {
             shm_state,
             dmabuf_state,
             dmabuf_global,
-            dmabuf_main_device,
             data_device_state,
             primary_selection_state,
             seat_state,
@@ -450,6 +463,7 @@ impl Glasspane {
             event_loop,
             state,
             socket_name,
+            dmabuf_main_device,
         })
     }
 
@@ -470,10 +484,12 @@ impl Glasspane {
     ///
     /// `None` alongside [`Glasspane::advertises_dmabuf`] is a v3 global: GL
     /// clients can still hand over dma-bufs, but Mesa finds no GPU through
-    /// it and renders them on the CPU. Worth saying in a shell's log, since
-    /// `advertises_dmabuf` alone reads as all being well.
+    /// it and renders them on the CPU. That is the answer both for an
+    /// adapter with no render node and for one whose query failed (the
+    /// failure is logged as a warning, not returned). Worth saying in a
+    /// shell's log, since `advertises_dmabuf` alone reads as all being well.
     pub fn dmabuf_main_device(&self) -> Option<libc::dev_t> {
-        self.state.dmabuf_main_device
+        self.dmabuf_main_device
     }
 
     /// Spawn a client on this compositor's socket.

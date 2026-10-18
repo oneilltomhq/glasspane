@@ -81,9 +81,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   so the global is v4 and up. Mesa's EGL takes its GPU from that event and
   nowhere else: on the v3 global, Ghostty rendered on llvmpipe at well over a
   core. A v3 client is offered the same pairs as before. An adapter with no
-  render node (a software one) keeps the v3 global.
-  `Glasspane::dmabuf_main_device` says which, since `advertises_dmabuf` alone
-  reads true either way.
+  render node (a software one) keeps the v3 global, and so does one whose
+  render node query fails: that is logged as a warning, not returned.
+  `Glasspane::dmabuf_main_device` reads `None` for both, since
+  `advertises_dmabuf` alone reads true either way.
 
 ## [0.1.0] - 2026-09-14
 
