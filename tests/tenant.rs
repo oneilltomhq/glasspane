@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use fixture::{Fixture, Layout, Report, Transport};
-use glasspane::{Caps, Event, Glasspane, KeyState, TenantId};
+use glasspane::{Caps, Event, Glasspane, KeyState, Selection, TenantId};
 
 /// A GPU that can import a dma-buf *and* import an acquire fence, or `None`.
 fn gpu() -> Option<(wgpu::Adapter, wgpu::Device, wgpu::Queue)> {
@@ -706,9 +706,6 @@ fn wl_clipboard_command(program: &std::path::Path, pane: &Glasspane) -> std::pro
 }
 
 /// Pump until a new toplevel maps, and give it the keyboard.
-///
-/// wl-clipboard has no data-control protocol to use here, so it does what any
-/// client must: map a surface, wait for keyboard focus, and use that serial.
 fn map_and_focus(pane: &mut Glasspane, events: &mut Vec<Event>, what: &str) -> TenantId {
     let from = events.len();
     let mut id = None;
@@ -724,81 +721,172 @@ fn map_and_focus(pane: &mut Glasspane, events: &mut Vec<Event>, what: &str) -> T
     id
 }
 
-/// Copy with one wl-clipboard client, paste with another, and return what the
-/// paste printed.
-fn copy_then_paste(tag: &str, flag: &[&str], text: &str) -> Option<String> {
-    let (copy, paste) = wl_clipboard()?;
+/// `events` without the frames, which say nothing about why a process waited.
+fn not_frames(events: &[Event]) -> Vec<&Event> {
+    events
+        .iter()
+        .filter(|e| !matches!(e, Event::Committed { .. }))
+        .collect()
+}
+
+/// Run a wl-clipboard process on `pane` to its exit, turning the pane while
+/// it runs, and panic if it has not exited within `timeout`.
+///
+/// Every request it makes goes through the compositor, so the pane must keep
+/// dispatching; and a process that waits for something the test never gives
+/// it (focus, most likely) must fail the test, not hang it.
+fn run_to_exit(
+    pane: &mut Glasspane,
+    events: &mut Vec<Event>,
+    mut cmd: std::process::Command,
+    what: &str,
+    timeout: Duration,
+) -> std::process::Output {
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn {what}: {e}"));
+    // Read as it is written: a paste bigger than the pipe buffer blocks the
+    // child on its write, and a child that never exits is a timeout here.
+    let mut stdout = child.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stdout, &mut out);
+        out
+    });
+    let exited = pump(pane, events, timeout, |_, _| {
+        child.try_wait().unwrap().is_some()
+    });
+    if !exited {
+        let _ = child.kill();
+        // Waited on even so: stderr is the likeliest why, and no zombie is left.
+        let out = child.wait_with_output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        // A surface it mapped to wait for focus is the other likely why.
+        panic!(
+            "{what} was still running after {timeout:?}: {err}; {:?}",
+            not_frames(events)
+        );
+    }
+    let mut out = child.wait_with_output().unwrap();
+    out.stdout = reader.join().unwrap();
+    out
+}
+
+/// A pane, with wl-copy and wl-paste to run on it, or `None` if either is
+/// missing.
+fn clipboard_pane(
+    tag: &str,
+) -> Option<(
+    Glasspane,
+    Vec<Event>,
+    (std::path::PathBuf, std::path::PathBuf),
+)> {
+    let tools = wl_clipboard()?;
     let (_adapter, device, queue) = gpu()?;
-    let mut pane = start(tag, None, device, queue);
-    let mut events = Vec::new();
+    Some((start(tag, None, device, queue), Vec::new(), tools))
+}
+
+/// Copy `text` into `selection` with wl-copy, and once the pane says it is
+/// set, paste it with wl-paste and return what the paste printed.
+///
+/// Neither process is given focus, and neither maps anything to be given it,
+/// whatever the caller set up before: with data control offered, wl-clipboard
+/// takes it, and a data-control client needs no surface.
+fn copy_then_paste(
+    pane: &mut Glasspane,
+    events: &mut Vec<Event>,
+    (copy, paste): &(std::path::PathBuf, std::path::PathBuf),
+    selection: Selection,
+    text: &str,
+) -> String {
+    let flag: &[&str] = match selection {
+        Selection::Clipboard => &[],
+        Selection::Primary => &["--primary"],
+    };
+    let mark = events.len();
 
     // --foreground so the process is ours to kill; by default wl-copy forks
     // and serves the selection from a child this test would leak.
-    let mut copier = wl_clipboard_command(&copy, &pane)
+    let mut copier = wl_clipboard_command(copy, pane)
         .arg("--foreground")
         .args(flag)
         .arg(text)
         .stdout(std::process::Stdio::null())
         .spawn()
         .expect("spawn wl-copy");
-    map_and_focus(&mut pane, &mut events, "wl-copy");
-    // wl-copy sets the selection on keyboard enter, then unmaps its surface.
-    // The selection outlives the surface; the source is what serves it.
-    pump(&mut pane, &mut events, Duration::from_secs(5), |_, evs| {
-        evs.iter().any(|e| matches!(e, Event::Unmapped { .. }))
+    let set = pump(pane, events, Duration::from_secs(10), |_, evs| {
+        evs[mark..].contains(&Event::SelectionChanged { selection })
     });
+    if !set {
+        let _ = copier.kill();
+        let status = copier.wait().unwrap();
+        let mut err = String::new();
+        let _ = std::io::Read::read_to_string(copier.stderr.as_mut().unwrap(), &mut err);
+        panic!(
+            "wl-copy never set the {selection:?} selection ({status}): {err}; {:?}",
+            not_frames(events)
+        );
+    }
 
-    let mut paster = wl_clipboard_command(&paste, &pane)
-        .arg("--no-newline")
-        .args(flag)
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn wl-paste");
-    let mut out = paster.stdout.take().unwrap();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = std::io::Read::read_to_string(&mut out, &mut s);
-        let _ = tx.send(s);
-    });
-    map_and_focus(&mut pane, &mut events, "wl-paste");
-    // The transfer is client to client, but every request of it goes through
-    // the compositor, so the pane must keep dispatching until the pipe closes.
-    let mut got = None;
-    pump(&mut pane, &mut events, Duration::from_secs(10), |_, _| {
-        got = rx.try_recv().ok();
-        got.is_some()
-    });
-
+    let mut cmd = wl_clipboard_command(paste, pane);
+    cmd.arg("--no-newline").args(flag);
+    let out = run_to_exit(pane, events, cmd, "wl-paste", Duration::from_secs(5));
     let _ = copier.kill();
     let _ = copier.wait();
-    let _ = paster.kill();
-    let status = paster.wait().unwrap();
-    let mut err = String::new();
-    let _ = std::io::Read::read_to_string(paster.stderr.as_mut().unwrap(), &mut err);
-    Some(got.unwrap_or_else(|| panic!("wl-paste never finished ({status}): {err}; {events:?}")))
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "wl-paste failed ({}): {err}",
+        out.status
+    );
+    let mapped = events[mark..]
+        .iter()
+        .filter(|e| matches!(e, Event::Mapped { .. }))
+        .count();
+    assert_eq!(
+        mapped,
+        0,
+        "wl-clipboard mapped {mapped} surfaces to wait for focus: {:?}",
+        not_frames(&events[mark..])
+    );
+    String::from_utf8(out.stdout).unwrap()
 }
+
+// The focus path (`set_data_device_focus` and `set_primary_focus` in
+// `focus_changed`) has no test: wl-clipboard always takes data control, and
+// the fixture has no `wl_data_device` to copy over.
 
 /// **A primary selection crosses from one tenant to another.**
 ///
 /// Select-then-middle-click, as two wl-clipboard processes: one owns the
-/// `zwp_primary_selection_v1` selection, a second one, focused afterwards, is
-/// offered it and reads it. Without the primary selection global wl-paste
-/// refuses outright; without `set_primary_focus` on a focus change it is
-/// never offered anything.
+/// primary selection, a second one reads it. Both go through data control,
+/// which carries the primary selection only because glasspane has its
+/// global too; without `zwp_primary_selection_device_manager_v1` wl-copy
+/// refuses outright.
 #[test]
 fn a_primary_selection_crosses_between_tenants() {
-    if let Some(got) = copy_then_paste("primary", &["--primary"], "hello") {
-        assert_eq!(got, "hello");
-    }
+    let Some((mut pane, mut events, tools)) = clipboard_pane("primary") else {
+        return;
+    };
+    let got = copy_then_paste(&mut pane, &mut events, &tools, Selection::Primary, "hello");
+    assert_eq!(got, "hello");
 }
 
 /// **The clipboard crosses from one tenant to another**, the same way.
 #[test]
 fn a_clipboard_selection_crosses_between_tenants() {
-    if let Some(got) = copy_then_paste("clipboard", &[], "hello clipboard") {
-        assert_eq!(got, "hello clipboard");
-    }
+    let Some((mut pane, mut events, tools)) = clipboard_pane("clipboard") else {
+        return;
+    };
+    let got = copy_then_paste(
+        &mut pane,
+        &mut events,
+        &tools,
+        Selection::Clipboard,
+        "hello clipboard",
+    );
+    assert_eq!(got, "hello clipboard");
 }
 
 /// Turn two panes in step, so a transfer that crosses both (the bridge is a
@@ -824,35 +912,6 @@ fn pump_both(
         }
     }
     false
-}
-
-/// [`map_and_focus`] on `pane`, with `other` turning too.
-fn map_and_focus_both(
-    pane: &mut Glasspane,
-    events: &mut Vec<Event>,
-    other: &mut Glasspane,
-    other_events: &mut Vec<Event>,
-    what: &str,
-) -> TenantId {
-    let from = events.len();
-    let mut id = None;
-    pump_both(
-        pane,
-        events,
-        other,
-        other_events,
-        Duration::from_secs(10),
-        |evs, _| {
-            id = evs[from..].iter().find_map(|e| match e {
-                Event::Mapped { id, .. } => Some(*id),
-                _ => None,
-            });
-            id.is_some()
-        },
-    );
-    let id = id.unwrap_or_else(|| panic!("{what} never mapped a toplevel: {events:?}"));
-    pane.set_keyboard_focus(Some(id)).unwrap();
-    id
 }
 
 /// The fixture's connection as a window's display handle, the way winit's
@@ -971,65 +1030,82 @@ impl Bridged {
         }
     }
 
-    /// wl-copy `text` on one side, and wait until it has set the selection
-    /// and unmapped. It stays running: its source is what serves the paste.
+    /// wl-copy `text` on one side, and wait until that side says the
+    /// clipboard is set. It stays running: its source is what serves the
+    /// paste. It takes data control, so it maps nothing and the window keeps
+    /// the desktop's keyboard.
     fn copy(&mut self, on_desk: bool, text: &str) {
         let program = self.copy.clone();
         let (pane, events, other, other_events) = self.panes(on_desk);
+        let mark = events.len();
         let copier = wl_clipboard_command(&program, pane)
             .arg("--foreground")
             .arg(text)
             .stdout(std::process::Stdio::null())
             .spawn()
             .expect("spawn wl-copy");
-        let id = map_and_focus_both(pane, events, other, other_events, "wl-copy");
-        let gone = pump_both(
-            pane,
-            events,
-            other,
-            other_events,
-            Duration::from_secs(5),
-            |evs, _| {
-                evs.iter()
-                    .any(|e| matches!(e, Event::Unmapped { id: u } if *u == id))
-            },
-        );
-        assert!(gone, "wl-copy never unmapped: {events:?}");
-        self.children.push(copier);
-    }
-
-    /// wl-paste on one side, and what it printed, or `None` if it printed
-    /// nothing in 10 s.
-    fn paste(&mut self, on_desk: bool) -> Option<String> {
-        let program = self.paste.clone();
-        let (pane, events, other, other_events) = self.panes(on_desk);
-        let mut paster = wl_clipboard_command(&program, pane)
-            .arg("--no-newline")
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn wl-paste");
-        let mut out = paster.stdout.take().unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut s = String::new();
-            let _ = std::io::Read::read_to_string(&mut out, &mut s);
-            let _ = tx.send(s);
-        });
-        map_and_focus_both(pane, events, other, other_events, "wl-paste");
-        let mut got = None;
-        pump_both(
+        let set = pump_both(
             pane,
             events,
             other,
             other_events,
             Duration::from_secs(10),
-            |_, _| {
-                got = rx.try_recv().ok();
-                got.is_some()
+            |evs, _| {
+                evs[mark..].contains(&Event::SelectionChanged {
+                    selection: Selection::Clipboard,
+                })
             },
         );
-        self.children.push(paster);
-        got
+        assert!(
+            set,
+            "wl-copy never set the clipboard: {:?}",
+            not_frames(events)
+        );
+        self.children.push(copier);
+    }
+
+    /// wl-paste on one side until one gets the clipboard, and what it
+    /// printed, or `None` if none had in 10 s.
+    ///
+    /// A copy is announced only on the side it was made on; nothing says
+    /// when it has crossed the bridge, so a paste on the other side that
+    /// comes first is told "Nothing is copied" and exits 1. Each wl-paste
+    /// must exit within 5 s: one still running is waiting for focus.
+    fn paste(&mut self, on_desk: bool) -> Option<String> {
+        let program = self.paste.clone();
+        let (pane, events, other, other_events) = self.panes(on_desk);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let mut paster = wl_clipboard_command(&program, pane)
+                .arg("--no-newline")
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn wl-paste");
+            let mut stdout = paster.stdout.take().unwrap();
+            let reader = std::thread::spawn(move || {
+                let mut out = Vec::new();
+                let _ = std::io::Read::read_to_end(&mut stdout, &mut out);
+                out
+            });
+            let exited = pump_both(
+                pane,
+                events,
+                other,
+                other_events,
+                Duration::from_secs(5),
+                |_, _| paster.try_wait().unwrap().is_some(),
+            );
+            if !exited {
+                let _ = paster.kill();
+            }
+            let out = paster.wait_with_output().unwrap();
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(exited, "wl-paste was still running after 5 s: {err}");
+            if out.status.success() {
+                return Some(String::from_utf8(reader.join().unwrap()).unwrap());
+            }
+        }
+        None
     }
 }
 
@@ -1044,7 +1120,7 @@ impl Drop for Bridged {
 
 /// **A copy on the desktop pastes into a tenant.**
 ///
-/// wl-copy owns the desktop's clipboard; the window is given the desktop's
+/// wl-copy owns the desktop's clipboard; the window has the desktop's
 /// keyboard, which is when a desktop offers a window its clipboard; and
 /// wl-paste, a tenant of the shell's pane, is offered it and reads it. The
 /// bytes go from wl-copy to wl-paste through both compositors, by the
@@ -1055,9 +1131,6 @@ fn a_desktop_copy_pastes_into_a_tenant() {
         return;
     };
     b.copy(true, "hunter2");
-    // wl-copy took the desktop's keyboard; the window has it back.
-    let window = b.window_id;
-    b.desk.set_keyboard_focus(Some(window)).unwrap();
     let got = b.paste(false);
     assert_eq!(
         got.as_deref(),
@@ -1103,9 +1176,6 @@ fn an_unfocused_tenant_copy_pastes_on_the_desktop_after_focus() {
     b.copy(false, "copied while away");
     let window = b.window_id;
     b.desk.set_keyboard_focus(Some(window)).unwrap();
-    // And for it to hear the enter, and offer the copy with its serial,
-    // before wl-paste takes the keyboard.
-    b.turn(Duration::from_millis(300), |_, _| false);
     let got = b.paste(true);
     assert_eq!(
         got.as_deref(),
@@ -1114,6 +1184,53 @@ fn an_unfocused_tenant_copy_pastes_on_the_desktop_after_focus() {
         b.desk_events,
         b.nest_events
     );
+}
+
+/// **`wl-paste -l` answers without focus.** This is what Claude Code runs
+/// on ctrl+v in a terminal pane, to see whether an image is copied. With no
+/// data-control global, wl-paste maps an invisible toplevel and waits for
+/// keyboard focus no shell gives it, so it never returns (#14). With nothing
+/// copied it says so and exits 1; an empty list would do as well.
+#[test]
+fn wl_paste_lists_the_clipboard_without_focus() {
+    let Some((mut pane, mut events, (_copy, paste))) = clipboard_pane("list") else {
+        return;
+    };
+    let mut cmd = wl_clipboard_command(&paste, &pane);
+    cmd.arg("--list-types");
+    let out = run_to_exit(
+        &mut pane,
+        &mut events,
+        cmd,
+        "wl-paste --list-types",
+        Duration::from_secs(5),
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() || err.contains("Nothing is copied"),
+        "wl-paste --list-types failed ({}): {err}",
+        out.status
+    );
+    assert!(out.stdout.is_empty(), "types listed with nothing copied");
+}
+
+/// **A copy and a paste from tenants without focus**, while another tenant
+/// holds it: a terminal keeps the keyboard while a `wl-copy` or `wl-paste`
+/// it spawned runs, and neither of those will ever be focused.
+#[test]
+fn a_copy_without_focus_pastes_without_focus() {
+    for (tag, selection) in [
+        ("unfocused", Selection::Clipboard),
+        ("unfocused-primary", Selection::Primary),
+    ] {
+        let Some((mut pane, mut events, tools)) = clipboard_pane(tag) else {
+            return;
+        };
+        let (_holder, id) = map_tenant(&mut pane, Transport::Shm, &mut events);
+        pane.set_keyboard_focus(Some(id)).unwrap();
+        let got = copy_then_paste(&mut pane, &mut events, &tools, selection, "hello unfocused");
+        assert_eq!(got, "hello unfocused", "{selection:?}");
+    }
 }
 
 /// `foot` on `PATH`, or `None`, saying so.

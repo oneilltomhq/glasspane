@@ -46,6 +46,7 @@ use smithay::wayland::selection::data_device::{
     current_data_device_selection_userdata, request_data_device_client_selection,
     set_data_device_focus, set_data_device_selection,
 };
+use smithay::wayland::selection::{ext_data_control, wlr_data_control};
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
 use smithay::wayland::shell::kde::decoration::{KdeDecorationHandler, KdeDecorationState};
 use smithay::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::{
@@ -65,7 +66,7 @@ use crate::popup::{Parent, Popup, PopupId};
 use crate::registry::{BufferKey, Registry};
 use crate::tenant::{Tenant, TenantId};
 use crate::texture::Skin;
-use crate::{texture, Event};
+use crate::{texture, Event, Selection};
 
 /// Which of the two lists a commit, a texture or an input event is about.
 ///
@@ -318,6 +319,13 @@ pub struct State {
     /// The desktop's clipboard, once a shell in a window has handed over
     /// its connection ([`crate::Glasspane::bridge_clipboard`]).
     pub(crate) clipboard: Option<Bridge>,
+    /// `ext_data_control_manager_v1`, held only for its handler trait to
+    /// hand back; who may bind it is `every_tenant` in lib.rs.
+    pub(crate) ext_data_control_state: ext_data_control::DataControlState,
+    /// `zwlr_data_control_manager_v1`, the protocol the ext one replaces and
+    /// the only one wl-clipboard 2.2.1 and most clipboard managers speak.
+    /// Held the same way.
+    pub(crate) wlr_data_control_state: wlr_data_control::DataControlState,
     pub(crate) seat_state: SeatState<Self>,
     /// The seat itself is driven through `keyboard` and `pointer`; it is held
     /// because dropping it destroys the `wl_seat` global.
@@ -1926,15 +1934,23 @@ impl SelectionHandler for State {
     /// what it carries is the desktop's offer, to read a paste from.
     type SelectionUserData = Offer;
 
-    /// A tenant copied, or cleared its clipboard: the desktop is offered the
-    /// copy, or ours is withdrawn, when there is one. The primary selection
-    /// stays here.
+    /// A tenant copied, or cleared a selection, over its data device or
+    /// data control: the shell is told which, and for the clipboard the
+    /// desktop is offered the copy, or ours is withdrawn, when there is one.
+    /// The primary selection stays here. Smithay stores the selection right
+    /// after this returns, so by the time the shell drains the event a paste
+    /// gets it.
     fn new_selection(
         &mut self,
         ty: SelectionTarget,
         source: Option<SelectionSource>,
         _seat: Seat<Self>,
     ) {
+        let selection = match ty {
+            SelectionTarget::Clipboard => Selection::Clipboard,
+            SelectionTarget::Primary => Selection::Primary,
+        };
+        self.emit(Event::SelectionChanged { selection });
         if let (SelectionTarget::Clipboard, Some(bridge)) = (ty, self.clipboard.as_mut()) {
             match source {
                 Some(source) => bridge.offer(source.mime_types()),
@@ -2006,6 +2022,18 @@ impl PrimarySelectionHandler for State {
     }
 }
 
+impl ext_data_control::DataControlHandler for State {
+    fn data_control_state(&self) -> &ext_data_control::DataControlState {
+        &self.ext_data_control_state
+    }
+}
+
+impl wlr_data_control::DataControlHandler for State {
+    fn data_control_state(&self) -> &wlr_data_control::DataControlState {
+        &self.wlr_data_control_state
+    }
+}
+
 impl smithay::wayland::selection::data_device::ClientDndGrabHandler for State {}
 impl ServerDndGrabHandler for State {}
 
@@ -2023,6 +2051,8 @@ smithay::delegate_xdg_decoration!(State);
 smithay::delegate_seat!(State);
 smithay::delegate_data_device!(State);
 smithay::delegate_primary_selection!(State);
+smithay::delegate_ext_data_control!(State);
+smithay::delegate_data_control!(State);
 smithay::delegate_output!(State);
 
 /// A seat and the two handles this crate drives it through.

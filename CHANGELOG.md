@@ -8,6 +8,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Data control: the `ext_data_control_manager_v1` and
+  `zwlr_data_control_manager_v1` globals, both covering the clipboard and the
+  primary selection. A data-control client reads and sets the selection
+  without keyboard focus, which is what clipboard tools are for. Without them
+  `wl-paste` from a terminal pane mapped an invisible toplevel and waited for
+  focus no shell gives it, for ever, so Claude Code's ctrl+v hung on
+  "Pasting..." (#14). Every client may bind them, as on sway, niri and cosmic:
+  everything on this socket is the shell's own tenant.
+  `Event::SelectionChanged { selection: Selection }` says a tenant copied or
+  cleared the clipboard or the primary selection, over its data device or
+  data control, once per set; a shell can show a clipboard indicator from it.
 - A toplevel's `xdg_surface.set_window_geometry` is honoured: the texture is
   the window alone, `Tenant::size` its size, and the pointer is handed over
   shifted by its offset, so a click lands where it was aimed. GTK draws every
