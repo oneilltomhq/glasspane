@@ -305,6 +305,138 @@ fn a_dmabuf_tenant_texture_is_byte_exact() {
     eprintln!("{report}");
 }
 
+/// A compute pass that keeps `queue` busy for roughly `target`, and the
+/// `sync_file` that signals when it is done: a stand-in for any submit that
+/// is not this tenant's, such as another tenant's blit waiting on its
+/// client's frame, or the shell's own. `None` if this GPU will not run long
+/// enough to tell apart from a fast one.
+fn hold_the_queue(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    target: Duration,
+) -> Option<wgpu_dmabuf::sync::SyncFile> {
+    use wgpu::util::DeviceExt as _;
+    const WGSL: &str = "
+        @group(0) @binding(0) var<storage, read_write> out: array<u32>;
+        @group(0) @binding(1) var<uniform> n: u32;
+        @compute @workgroup_size(64)
+        fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+            var x = id.x;
+            for (var i = 0u; i < n; i++) { x = x * 1664525u + 1013904223u; }
+            out[id.x] = x;
+        }";
+    const GROUPS: u32 = 1024;
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("hold the queue"),
+        source: wgpu::ShaderSource::Wgsl(WGSL.into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("hold the queue"),
+        layout: None,
+        module: &module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let out = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("hold the queue"),
+        size: u64::from(GROUPS) * 64 * 4,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let submit = |n: u32| {
+        let n = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("hold the queue"),
+            contents: &n.to_ne_bytes(),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("hold the queue"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: out.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: n.as_entire_binding(),
+                },
+            ],
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(GROUPS, 1, 1);
+        }
+        queue.submit([encoder.finish()])
+    };
+    // Calibrate: double the loop until one pass is long enough to time.
+    let mut n = 1u32 << 12;
+    let took = loop {
+        let at = Instant::now();
+        submit(n);
+        device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+        let took = at.elapsed();
+        if took >= Duration::from_millis(40) {
+            break took;
+        }
+        n = n.checked_mul(2)?;
+    };
+    let n = (f64::from(n) * target.as_secs_f64() / took.as_secs_f64()).min(f64::from(u32::MAX));
+    let fence = wgpu_dmabuf::sync::CompletionFence::new(device).ok()?;
+    let (done, _) = fence.export_for_submit(queue, || submit(n as u32)).ok()?;
+    Some(done)
+}
+
+/// **A recommit waits for its own blit, not for the queue.** Before a
+/// buffer's acquire semaphore takes a new fence, the submit that consumed
+/// the last one must have retired. That submit is the buffer's previous
+/// blit; work queued after it belongs to other tenants or the shell, and a
+/// commit that waited for it blocked the compositor on another client's GPU
+/// frame (see [`glasspane`]'s `acquire` module). So: a tenant commits, a long submit
+/// goes on the queue, the tenant commits the same buffer again, and that
+/// commit lands while the long submit is still running.
+#[test]
+fn a_recommit_does_not_wait_for_the_queue() {
+    let Some((adapter, device, queue)) = gpu() else {
+        return;
+    };
+    let mut pane = start("recommit", Some(&adapter), device, queue);
+    if !pane.advertises_dmabuf() {
+        eprintln!("SKIP: this adapter shares no single-plane ARGB8888 modifiers");
+        return;
+    }
+    let mut events = Vec::new();
+    let (_client, id) = map_tenant(&mut pane, Transport::Dmabuf, &mut events);
+    let generation = pane.tenant(id).unwrap().generation();
+
+    let (device, queue) = (pane.device().clone(), pane.queue().clone());
+    let Some(busy) = hold_the_queue(&device, &queue, Duration::from_millis(800)) else {
+        eprintln!("SKIP: cannot hold this GPU's queue long enough to measure");
+        return;
+    };
+    assert!(
+        !busy.is_signalled().unwrap(),
+        "the long submit finished before it could be waited on"
+    );
+
+    let landed = pump(&mut pane, &mut events, Duration::from_secs(5), |p, _| {
+        p.tenant(id).map(|t| t.generation()).unwrap_or(0) > generation
+    });
+    assert!(landed, "the tenant never committed again");
+    let waited = busy.is_signalled().unwrap();
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+    assert!(
+        !waited,
+        "the recommit did not land until a submit queued after its own blit had finished"
+    );
+}
+
 /// **The other byte order, byte for byte.** An `ABGR8888` dma-buf, which is
 /// what Android commits, lands in the tenant texture as the same lattice an
 /// `ARGB8888` one does: drawn across rather than copied, and not

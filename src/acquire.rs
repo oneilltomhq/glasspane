@@ -28,11 +28,17 @@
 //! is therefore keyed per `wl_buffer` — bounded by live buffers, not by
 //! frames.
 //!
-//! **`vkImportSemaphoreFdKHR` needs the consuming queue retired**
+//! **`vkImportSemaphoreFdKHR` needs the consuming submit retired**
 //! (`VUID-vkImportSemaphoreFdKHR-semaphore-01142`), and wgpu never retires a
 //! submit unless something polls. One `device.poll` before the import clears
 //! it, skipped on a buffer's first commit where nothing can be referencing a
-//! semaphore created two lines ago.
+//! semaphore created two lines ago. The poll is *to that submit*, the blit
+//! [`AcquireGate::carried_by`] was told about, and not to the end of the
+//! queue: draining the queue waits for every other tenant's blit, each gated
+//! on its own client's GPU frame, and for the shell's frame besides. With a
+//! terminal and a browser both busy that was over a millisecond on a fifth of
+//! commits and 67 ms at worst, spent in one tenant's commit on another's
+//! rendering.
 //!
 //! **A binary semaphore waited twice in one submit deadlocks.** A client can
 //! commit many times between two submits; naively staging a wait per commit
@@ -74,9 +80,46 @@ const WAIT_STAGE: wgpu_dmabuf::ash::vk::PipelineStageFlags =
 
 struct Slot {
     semaphore: AcquireSemaphore,
-    /// False until the first `wait_on_next_submit`. While false, no submit can
-    /// be referencing this semaphore, so the retire poll is not owed.
-    staged: bool,
+    /// Which submit consumed this semaphore's last staged wait, and so has to
+    /// retire before the next import.
+    carrier: Carrier,
+}
+
+/// What a slot's last staged wait was carried by.
+enum Carrier {
+    /// Nothing was ever staged: no submit can be referencing the semaphore,
+    /// so no retire poll is owed.
+    Never,
+    /// Staged, and not followed by a blit this gate was told about: an import
+    /// that failed after the wait went up leaves it for whichever submit comes
+    /// next. Retiring that means draining the queue.
+    Unknown,
+    /// Staged and consumed by this submit, which is the only one that has to
+    /// retire.
+    Submit(wgpu::SubmissionIndex),
+}
+
+impl Carrier {
+    /// Wait until no submit refers to the semaphore any more. `superseded`
+    /// says the last wait was withdrawn before any submit took it, in which
+    /// case the one before it was retired ahead of the import that replaced
+    /// it, and nothing is owed.
+    fn retire(&self, device: &wgpu::Device, superseded: bool) -> Result<(), wgpu::PollError> {
+        if superseded {
+            return Ok(());
+        }
+        let submission_index = match self {
+            Carrier::Never => return Ok(()),
+            Carrier::Unknown => None,
+            Carrier::Submit(index) => Some(index.clone()),
+        };
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index,
+                timeout: None,
+            })
+            .map(drop)
+    }
 }
 
 /// The per-`wl_buffer` acquire-semaphore pool and its ledger.
@@ -149,7 +192,7 @@ impl AcquireGate {
                 key,
                 Slot {
                     semaphore,
-                    staged: false,
+                    carrier: Carrier::Never,
                 },
             );
         }
@@ -162,46 +205,58 @@ impl AcquireGate {
         if superseded {
             self.superseded += 1;
         }
-        if slot.staged && !superseded {
-            // The previous wait was consumed by a submit that may not have
-            // retired, and importing a SYNC_FD payload into a semaphore an
-            // unretired submit refers to is a validation error. One poll
-            // clears it.
-            self.device
-                .poll(wgpu::PollType::wait_indefinitely())
-                .map_err(|e| format!("retire poll before acquire import: {e:?}"))?;
-        }
+        // The previous wait was consumed by a submit that may not have
+        // retired, and importing a SYNC_FD payload into a semaphore an
+        // unretired submit refers to is a validation error. One poll clears
+        // it.
+        slot.carrier
+            .retire(&self.device, superseded)
+            .map_err(|e| format!("retire poll before acquire import: {e:?}"))?;
         slot.semaphore
             .import(fence.sync_file)
             .map_err(|e| format!("importing a client sync_file: {e}"))?;
         slot.semaphore
             .wait_on_next_submit(&self.queue, WAIT_STAGE)
             .map_err(|e| format!("staging a client acquire wait: {e}"))?;
-        slot.staged = true;
+        slot.carrier = Carrier::Unknown;
         self.waits += 1;
         Ok(())
     }
 
+    /// Say which submit carried the wait [`Self::wait_for`] just staged for
+    /// `key`: the blit straight after it. The next commit of the same buffer
+    /// then polls to this submit and no further.
+    ///
+    /// Call it only for the submit that immediately followed the staging. A
+    /// later one would let the next import go ahead with the real carrier
+    /// still in flight.
+    pub fn carried_by(&mut self, key: BufferKey, index: wgpu::SubmissionIndex) {
+        if let Some(slot) = self.slots.get_mut(&key) {
+            slot.carrier = Carrier::Submit(index);
+        }
+    }
+
     /// Drop the semaphore for a destroyed `wl_buffer`.
     ///
-    /// **Two things happen before `vkDestroySemaphore`, not one.** The queue is
-    /// drained, because destroying a semaphore an unretired submit refers to is
-    /// a use-after-free the validation layer catches and the driver does not.
-    /// But `poll` retires *submits*; it does not touch the queue's list of
-    /// waits staged and not yet submitted, and a buffer is routinely destroyed
-    /// with one still staged. So the staged wait is withdrawn first, and only
-    /// then is the queue drained and the semaphore dropped.
+    /// **Two things happen before `vkDestroySemaphore`, not one.** The submit
+    /// that carried its last wait is retired, because destroying a semaphore
+    /// an unretired submit refers to is a use-after-free the validation layer
+    /// catches and the driver does not. But `poll` retires *submits*; it does
+    /// not touch the queue's list of waits staged and not yet submitted, and a
+    /// buffer is routinely destroyed with one still staged. So the staged wait
+    /// is withdrawn first, and only then is the carrier retired and the
+    /// semaphore dropped.
     pub fn forget(&mut self, key: BufferKey) {
         if let Some(slot) = self.slots.remove(&key) {
-            if slot.staged {
-                if slot
+            if !matches!(slot.carrier, Carrier::Never) {
+                let superseded = slot
                     .semaphore
                     .cancel_pending_wait(&self.queue)
-                    .unwrap_or(false)
-                {
+                    .unwrap_or(false);
+                if superseded {
                     self.superseded += 1;
                 }
-                let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+                let _ = slot.carrier.retire(&self.device, superseded);
             }
         }
     }
@@ -224,7 +279,7 @@ impl AcquireGate {
         if !self.slots.is_empty() {
             let mut withdrawn = 0;
             for slot in self.slots.values() {
-                if slot.staged
+                if !matches!(slot.carrier, Carrier::Never)
                     && slot
                         .semaphore
                         .cancel_pending_wait(&self.queue)

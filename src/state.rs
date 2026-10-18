@@ -755,24 +755,27 @@ impl State {
         let (width, height) = (dmabuf.width(), dmabuf.height());
         let opaque = dmabuf.format().code == drm_fourcc::DrmFourcc::Xrgb8888;
         let device = self.device.clone();
-        let described = crate::convert::describe(dmabuf)?;
-        let (_id, src, _imported) = self
-            .registry
-            .get_or_import(key, || {
-                wgpu_dmabuf::import(&device, &described, texture::IMPORT_USAGE)
-            })
-            .map_err(|e| format!("dmabuf import failed: {e}"))?;
+        // Described inside the closure, so only on a miss: describing dups
+        // the plane fd, which a cache hit would close again unread.
+        let (_id, src, _imported) = self.registry.get_or_import(key, || {
+            let described = crate::convert::describe(dmabuf)?;
+            wgpu_dmabuf::import(&device, &described, texture::IMPORT_USAGE)
+                .map_err(|e| format!("dmabuf import failed: {e}"))
+        })?;
 
         let frame = shape.frame((width, height), dest.window());
         let crop = frame.crop;
         let dst = self.target(dest, frame, opaque);
-        if src.format() == dst.format() {
-            texture::blit(&self.device, &self.queue, &src, &dst, crop);
+        let carrier = if src.format() == dst.format() {
+            texture::blit(&self.device, &self.queue, &src, &dst, crop)
         } else {
             let device = &self.device;
             self.reorder
                 .get_or_insert_with(|| texture::Reorder::new(device))
-                .draw(device, &self.queue, &src, &dst, crop);
+                .draw(device, &self.queue, &src, &dst, crop)
+        };
+        if let Some(gate) = self.acquire.as_mut() {
+            gate.carried_by(key, carrier);
         }
         Ok(())
     }
