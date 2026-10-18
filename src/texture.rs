@@ -134,14 +134,15 @@ pub(crate) fn upload_shm(
 ///
 /// The submit this issues is the one that carries the acquire wait staged by
 /// [`crate::acquire`], which is why the wait is staged at the top of the
-/// commit and not later.
+/// commit and not later. Its index is returned so the gate can retire exactly
+/// it before the buffer's next commit.
 pub(crate) fn blit(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     src: &wgpu::Texture,
     dst: &wgpu::Texture,
     crop: (u32, u32, u32, u32),
-) {
+) -> wgpu::SubmissionIndex {
     let (x, y, width, height) = crop;
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("glasspane tenant blit"),
@@ -165,7 +166,7 @@ pub(crate) fn blit(
             depth_or_array_layers: 1,
         },
     );
-    queue.submit([encoder.finish()]);
+    queue.submit([encoder.finish()])
 }
 
 /// Draws an imported image whose format is not [`TENANT_FORMAT`] into a
@@ -267,8 +268,9 @@ impl Reorder {
     }
 
     /// [`blit`]'s contract, drawn rather than copied: the `crop` rectangle
-    /// of `src` into `dst` at its origin, in one submit. `dst` is the crop's
-    /// size (`ensure_texture` made it so), so the triangle covers all of it.
+    /// of `src` into `dst` at its origin, in one submit, whose index is
+    /// returned. `dst` is the crop's size (`ensure_texture` made it so), so
+    /// the triangle covers all of it.
     pub(crate) fn draw(
         &self,
         device: &wgpu::Device,
@@ -276,7 +278,7 @@ impl Reorder {
         src: &wgpu::Texture,
         dst: &wgpu::Texture,
         crop: (u32, u32, u32, u32),
-    ) {
+    ) -> wgpu::SubmissionIndex {
         use wgpu::util::DeviceExt as _;
         let (x, y, _, _) = crop;
         // A vec2<u32>, padded to the 16 bytes a uniform binding is sized in.
@@ -328,7 +330,7 @@ impl Reorder {
             pass.set_bind_group(0, &bind, &[]);
             pass.draw(0..3, 0..1);
         }
-        queue.submit([encoder.finish()]);
+        queue.submit([encoder.finish()])
     }
 }
 
