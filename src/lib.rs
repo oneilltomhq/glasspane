@@ -137,6 +137,7 @@ use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufState};
 use smithay::wayland::fractional_scale::FractionalScaleManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::selection::primary_selection::PrimarySelectionState;
+use smithay::wayland::selection::{ext_data_control, wlr_data_control};
 use smithay::wayland::shell::kde::decoration::KdeDecorationState;
 use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
 use smithay::wayland::shell::xdg::XdgShellState;
@@ -287,6 +288,18 @@ impl Glasspane {
         let shm_state = ShmState::new::<State>(&dh, vec![]);
         let data_device_state = DataDeviceState::new::<State>(&dh);
         let primary_selection_state = PrimarySelectionState::new::<State>(&dh);
+        // Both carry the primary selection too, and both are open to every
+        // client: `State::ext_data_control_state` says why.
+        let ext_data_control_state = ext_data_control::DataControlState::new::<State, _>(
+            &dh,
+            Some(&primary_selection_state),
+            |_| true,
+        );
+        let wlr_data_control_state = wlr_data_control::DataControlState::new::<State, _>(
+            &dh,
+            Some(&primary_selection_state),
+            |_| true,
+        );
         let mut dmabuf_state = DmabufState::new();
 
         // The advertisement is derived from the device, never hardcoded: a
@@ -438,6 +451,8 @@ impl Glasspane {
             data_device_state,
             primary_selection_state,
             clipboard: None,
+            ext_data_control_state,
+            wlr_data_control_state,
             seat_state,
             seat,
             keyboard,

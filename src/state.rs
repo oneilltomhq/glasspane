@@ -46,6 +46,7 @@ use smithay::wayland::selection::data_device::{
     current_data_device_selection_userdata, request_data_device_client_selection,
     set_data_device_focus, set_data_device_selection,
 };
+use smithay::wayland::selection::{ext_data_control, wlr_data_control};
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
 use smithay::wayland::shell::kde::decoration::{KdeDecorationHandler, KdeDecorationState};
 use smithay::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::{
@@ -318,6 +319,18 @@ pub struct State {
     /// The desktop's clipboard, once a shell in a window has handed over
     /// its connection ([`crate::Glasspane::bridge_clipboard`]).
     pub(crate) clipboard: Option<Bridge>,
+    /// `ext_data_control_manager_v1`. A data-control client reads and sets
+    /// the clipboard and the primary selection without keyboard focus, and
+    /// that is the point: a `wl-paste` run from a terminal has no surface
+    /// the shell will ever focus, and without data control it maps an
+    /// invisible toplevel and waits for focus for ever (Claude Code's ctrl+v
+    /// hung on "Pasting..." that way, #14). Every client may bind it, as on
+    /// sway, niri and cosmic: every client on this socket is the shell's own
+    /// tenant, so there is no stranger to keep out.
+    pub(crate) ext_data_control_state: ext_data_control::DataControlState,
+    /// `zwlr_data_control_manager_v1`, the protocol the ext one replaces and
+    /// the only one wl-clipboard 2.2.1 and most clipboard managers speak.
+    pub(crate) wlr_data_control_state: wlr_data_control::DataControlState,
     pub(crate) seat_state: SeatState<Self>,
     /// The seat itself is driven through `keyboard` and `pointer`; it is held
     /// because dropping it destroys the `wl_seat` global.
@@ -2006,6 +2019,18 @@ impl PrimarySelectionHandler for State {
     }
 }
 
+impl ext_data_control::DataControlHandler for State {
+    fn data_control_state(&self) -> &ext_data_control::DataControlState {
+        &self.ext_data_control_state
+    }
+}
+
+impl wlr_data_control::DataControlHandler for State {
+    fn data_control_state(&self) -> &wlr_data_control::DataControlState {
+        &self.wlr_data_control_state
+    }
+}
+
 impl smithay::wayland::selection::data_device::ClientDndGrabHandler for State {}
 impl ServerDndGrabHandler for State {}
 
@@ -2023,6 +2048,8 @@ smithay::delegate_xdg_decoration!(State);
 smithay::delegate_seat!(State);
 smithay::delegate_data_device!(State);
 smithay::delegate_primary_selection!(State);
+smithay::delegate_ext_data_control!(State);
+smithay::delegate_data_control!(State);
 smithay::delegate_output!(State);
 
 /// A seat and the two handles this crate drives it through.
