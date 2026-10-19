@@ -184,8 +184,11 @@ pub enum Report {
     /// The subsurface committed, painted with this phase of
     /// [`sub_pattern`]. `n` counts its commits.
     SubCommitted { n: u64, phase: u32 },
-    /// `wl_pointer.enter`, in **surface-local** coordinates.
+    /// `wl_pointer.enter` on the toplevel, in **surface-local** coordinates.
     PointerEnter(f64, f64),
+    /// `wl_pointer.enter` on the subsurface of a [`Layout`] that has one,
+    /// in the **subsurface's** own coordinates.
+    SubPointerEnter(f64, f64),
     /// `wl_pointer.motion`.
     PointerMotion(f64, f64),
     /// `wl_pointer.button`: evdev code, and whether it went down.
@@ -900,10 +903,17 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Client {
     ) {
         let report = match event {
             wl_pointer::Event::Enter {
+                surface,
                 surface_x,
                 surface_y,
                 ..
-            } => Report::PointerEnter(surface_x, surface_y),
+            } => {
+                if state.sub.as_ref().is_some_and(|(sub, _)| *sub == surface) {
+                    Report::SubPointerEnter(surface_x, surface_y)
+                } else {
+                    Report::PointerEnter(surface_x, surface_y)
+                }
+            }
             wl_pointer::Event::Motion {
                 surface_x,
                 surface_y,

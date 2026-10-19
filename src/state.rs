@@ -29,7 +29,7 @@ use smithay::wayland::buffer::BufferHandler;
 use smithay::utils::Transform;
 use smithay::wayland::compositor::{
     BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
-    SubsurfaceCachedState, SurfaceAttributes, SurfaceData, TraversalAction, get_children,
+    RegionAttributes, SubsurfaceCachedState, SurfaceAttributes, SurfaceData, TraversalAction, get_children,
     get_parent, send_surface_state, with_states, with_surface_tree_upward,
 };
 use smithay::wayland::fractional_scale::{
@@ -1176,6 +1176,8 @@ struct Piece {
     buffer: Option<WlBuffer>,
     shape: Shape,
     layer: Option<(Arc<wgpu::Texture>, (u32, u32), bool)>,
+    /// Its input region, `None` for the whole surface.
+    input: Option<RegionAttributes>,
 }
 
 fn layer_snapshot(states: &SurfaceData) -> Option<(Arc<wgpu::Texture>, (u32, u32), bool)> {
@@ -1203,14 +1205,15 @@ fn walk(root: &WlSurface) -> (Vec<Piece>, u64) {
             let Some(at) = at else {
                 return;
             };
-            let buffer = match &states
-                .cached_state
-                .get::<SurfaceAttributes>()
-                .current()
-                .buffer
-            {
-                Some(BufferAssignment::NewBuffer(b)) => Some(b.clone()),
-                _ => None,
+            // The attributes' lock is let go before `Shape::of` takes it.
+            let (buffer, input) = {
+                let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+                let attributes = attributes.current();
+                let buffer = match &attributes.buffer {
+                    Some(BufferAssignment::NewBuffer(b)) => Some(b.clone()),
+                    _ => None,
+                };
+                (buffer, attributes.input_region.clone())
             };
             pieces.push(Piece {
                 surface: surface.clone(),
@@ -1218,11 +1221,40 @@ fn walk(root: &WlSurface) -> (Vec<Piece>, u64) {
                 buffer,
                 shape: Shape::of(states),
                 layer: layer_snapshot(states),
+                input,
             });
         },
         |_, _, _| true,
     );
     (pieces, hash.finish())
+}
+
+/// The surface of the tree under `root` that is under `point`, in the root's
+/// own logical pixels, and where that surface sits in the root: the
+/// frontmost drawn layer whose rectangle and input region hold the point.
+/// `None` for a point on no layer, and for a root drawn alone, which has no
+/// layers: either is the caller's to take as the root's.
+///
+/// smithay's `under_from_surface_tree` is not used: it reads the renderer
+/// bookkeeping (`RendererSurfaceState`) that `on_commit_buffer_handler`
+/// keeps, and this crate imports buffers its own way and keeps none. The
+/// layers are placed as [`walk`] places them to draw, so what is hit is
+/// what is seen.
+pub(crate) fn under(root: &WlSurface, point: (f64, f64)) -> Option<(WlSurface, (i32, i32))> {
+    let (pieces, _) = walk(root);
+    pieces.into_iter().rev().find_map(|piece| {
+        let (_, (w, h), _) = piece.layer?;
+        let (x, y) = (
+            point.0 - f64::from(piece.at.0),
+            point.1 - f64::from(piece.at.1),
+        );
+        let inside = x >= 0.0 && y >= 0.0 && x < f64::from(w) && y < f64::from(h);
+        let taken = piece
+            .input
+            .as_ref()
+            .is_none_or(|region| region.contains((x.floor() as i32, y.floor() as i32)));
+        (inside && taken).then_some((piece.surface, piece.at))
+    })
 }
 
 /// The size of a tree's composite texture: the root's logical size, at the
