@@ -203,7 +203,10 @@ the desktop: copy in a desktop app and paste in a tenant, or the other way.
 It rides the window's own connection, so the desktop treats it as the window
 copying and pasting, and it works only while the window has the keyboard.
 
-Not yet: subsurfaces, damage tracking
+Subsurfaces are composed into their toplevel's texture and take the pointer;
+the keyboard stays on the toplevel.
+
+Not yet: damage tracking
 (an shm commit uploads the whole buffer), multi-plane formats, drag-and-drop
 beyond the plumbing to accept it, `wp_viewport`, fractional scale, and KMS
 scanout of the composited result.
