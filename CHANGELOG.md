@@ -85,6 +85,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- The pointer enters the frontmost subsurface under it, in that surface's own
+  pixels, instead of always the toplevel's root surface. Chromium's camera and
+  microphone prompt is a subsurface: it was drawn, but every click on it went
+  to the page beneath (oneilltomhq/upfront#142). The shell still aims at the
+  tenant; which surface of its tree hears the pointer is settled here.
 - The focused tenant is told it is focused: `xdg_toplevel` carries the
   `activated` state, and keeps it while one of its own popups has the
   keyboard. A browser only offers a menu to a window it believes is active.

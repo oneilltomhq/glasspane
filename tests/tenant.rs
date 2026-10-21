@@ -545,6 +545,68 @@ fn a_pointer_click_arrives_where_it_was_aimed() {
     );
 }
 
+/// **A click inside a subsurface enters the subsurface.**
+///
+/// A `wl_subsurface` is a surface of its own: Chromium's permission bubble
+/// on an app window, Wine's menus. The compositor is told a point inside
+/// the fixture's subsurface, in tenant-local pixels; the *client* must hear
+/// `enter` on the subsurface, in the subsurface's own coordinates, and then
+/// the button. A point beside it enters the toplevel as before. Both on the
+/// plain tree and on the shadowed one, where the tenant's pixels are the
+/// window's and the surface starts `SHADOW` before them.
+#[test]
+fn a_click_inside_a_subsurface_enters_the_subsurface() {
+    let Some((_adapter, device, queue)) = gpu() else {
+        return;
+    };
+    for layout in [Layout::Subsurface, Layout::ShadowedTree] {
+        let mut pane = start(
+            &format!("sub-pointer-{layout:?}"),
+            None,
+            device.clone(),
+            queue.clone(),
+        );
+        let mut events = Vec::new();
+        let (client, id) = map_tree(&mut pane, Transport::Shm, layout, &mut events);
+        // The subsurface sits at `sub_at` in the surface's pixels; the
+        // tenant's are the window's, `margin` in from the surface's corner.
+        let margin = f64::from(fixture::margin(layout));
+        let (sx, sy) = fixture::sub_at(layout);
+        let (sx, sy) = (f64::from(sx) - margin, f64::from(sy) - margin);
+
+        pane.pointer_enter(id, sx + 10.5, sy + 6.5).unwrap();
+        pane.pointer_button(glasspane::input::button::LEFT, KeyState::Pressed);
+        pane.pointer_button(glasspane::input::button::LEFT, KeyState::Released);
+        pump(
+            &mut pane,
+            &mut events,
+            Duration::from_millis(500),
+            |_, _| false,
+        );
+        client.expect(
+            Duration::from_secs(2),
+            |r| matches!(r, Report::SubPointerEnter(x, y) if *x == 10.5 && *y == 6.5),
+        );
+        client.expect(
+            Duration::from_secs(2),
+            |r| matches!(r, Report::PointerButton(b, true) if *b == glasspane::input::button::LEFT),
+        );
+
+        // Beside it: the toplevel, in its own pixels.
+        pane.pointer_enter(id, sx - 2.5, sy + 6.5).unwrap();
+        pump(
+            &mut pane,
+            &mut events,
+            Duration::from_millis(500),
+            |_, _| false,
+        );
+        client.expect(
+            Duration::from_secs(2),
+            |r| matches!(r, Report::PointerEnter(x, y) if *x == sx - 2.5 + margin && *y == sy + 6.5 + margin),
+        );
+    }
+}
+
 /// **A key arrives as the same evdev code it was sent as.**
 #[test]
 fn a_key_survives_the_xkb_offset() {

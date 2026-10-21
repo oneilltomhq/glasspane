@@ -15,6 +15,12 @@
 //! surface. Either way the point a shell aims at on the texture is the pixel
 //! the client drew there.
 //!
+//! Which surface of the tenant's tree hears the pointer is this crate's to
+//! settle, not the shell's: a tenant with `wl_subsurface`s (Chromium's
+//! permission bubble on an app window, Wine's menus) is one texture to the
+//! shell, and the point it aims at is put on the frontmost subsurface drawn
+//! there, in that surface's own pixels. The shell never sees a subsurface.
+//!
 //! Logical, not buffer: a tenant drawing at scale 2 has a texture twice its
 //! size in each direction, and the coordinate for the same spot is the same
 //! number at either scale. The scale is a question of how sharp the pixels
@@ -170,21 +176,41 @@ impl Glasspane {
             .state
             .slot_of_target(target)
             .ok_or_else(|| target.missing())?;
-        let surface = self.state.surface_of(slot);
+        let root = self.state.surface_of(slot);
         let (ox, oy) = self.state.skin(slot).origin;
-        let serial = SERIAL_COUNTER.next_serial();
-        let time = self.state.now_ms();
-        let pointer = self.state.pointer.clone();
         // The focus point is the surface's origin *in the pointer's own
         // coordinate space*, and the client is told `location - origin`. The
         // location we are handing over is tenant-local, which is the texture's
         // space: the surface's own for most clients, its window for one that
-        // draws a shadow round it (`Skin::origin`). So the surface starts at
-        // minus the window's offset, and the client is told where it was
+        // draws a shadow round it (`Skin::origin`). So the root surface starts
+        // at minus the window's offset, and the client is told where it was
         // aimed in the pixels it drew.
+        let origin = (-f64::from(ox), -f64::from(oy));
+        // The surface under the point is the deepest of the tree, not the
+        // root: a `wl_subsurface` is a surface of its own, and its client
+        // hears the pointer only when the pointer enters *it*. Chromium's
+        // permission bubble ("Allow camera and microphone") on an app window
+        // is one, drawn into the window's texture here (`compose`); Wine's
+        // menus and GL client areas are others. Aimed at the root, a click on
+        // the bubble lands on the page under it and the bubble never hears
+        // it. The tree is walked as it is drawn (`state::under`), offsets
+        // and input regions included, for the surface and where it sits in
+        // the root's own pixels; a point on no layer of the tree, or a root
+        // drawn alone, is the root's, as before.
+        let in_root = (x - origin.0, y - origin.1);
+        let (surface, at) = match crate::state::under(&root, in_root) {
+            Some((surface, (sx, sy))) => (
+                surface,
+                (origin.0 + f64::from(sx), origin.1 + f64::from(sy)),
+            ),
+            None => (root, origin),
+        };
+        let serial = SERIAL_COUNTER.next_serial();
+        let time = self.state.now_ms();
+        let pointer = self.state.pointer.clone();
         pointer.motion(
             &mut self.state,
-            Some((surface, (-f64::from(ox), -f64::from(oy)).into())),
+            Some((surface, at.into())),
             &MotionEvent {
                 location: (x, y).into(),
                 serial,
