@@ -42,7 +42,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and `dismiss_popups_of` do the same without a click.
 - `xdg_popup.reposition` is answered, and the popup moves.
 - `input::Target` and the `*_at` input entry points, for aiming pointer and
-  keyboard at a popup in its own buffer pixels. The `TenantId` entry points
+  keyboard at a popup in its own logical pixels. The `TenantId` entry points
   are unchanged.
 - `Error::NoSuchPopup`.
 - Primary selection: the `zwp_primary_selection_device_manager_v1` global,
@@ -88,7 +88,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The pointer enters the frontmost subsurface under it, in that surface's own
   pixels, instead of always the toplevel's root surface. Chromium's camera and
   microphone prompt is a subsurface: it was drawn, but every click on it went
-  to the page beneath (oneilltomhq/upfront#142). The shell still aims at the
+  to the page beneath in a downstream shell. The shell still aims at the
   tenant; which surface of its tree hears the pointer is settled here.
 - The focused tenant is told it is focused: `xdg_toplevel` carries the
   `activated` state, and keeps it while one of its own popups has the

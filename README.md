@@ -1,8 +1,14 @@
 # glasspane
 
+[![CI](https://github.com/oneilltomhq/glasspane/actions/workflows/ci.yml/badge.svg)](https://github.com/oneilltomhq/glasspane/actions/workflows/ci.yml)
+
 **A tenant Wayland compositor as a library.** It speaks Wayland to real clients
 — terminals, browsers — and its entire output is one `wgpu::Texture` per client
 plus an input-injection API.
+
+It was built as the compositor layer of
+[Upfront](https://github.com/oneilltomhq/upfront), a Wayland shell, and
+depends on nothing in it.
 
 ```
   socket ─ wl_compositor + xdg_shell + zwp_linux_dmabuf_v1 + wl_shm
@@ -38,7 +44,39 @@ own. That is not a limitation to be lifted later; a caller that wants a window
 makes one.
 
 **Never links GL or EGL.** The only GPU API in the dependency tree is Vulkan,
-through `wgpu` and [`wgpu-dmabuf`](../wgpu-dmabuf).
+through `wgpu` and [`wgpu-dmabuf`](https://github.com/oneilltomhq/wgpu-dmabuf).
+
+## Requirements
+
+* Linux. Wayland, DRM and dma-buf are Linux interfaces; nothing here builds
+  for anything else.
+* A Vulkan driver with the dma-buf extensions: `VK_KHR_external_memory_fd`,
+  `VK_EXT_external_memory_dma_buf`, `VK_EXT_image_drm_format_modifier`, and
+  `VK_KHR_external_semaphore_fd` for the acquire fence. Mesa's ANV and RADV
+  have them.
+* A DRM render node, `/dev/dri/renderD*`, that your user can open.
+* To build: Rust 1.87 or later and libxkbcommon (`libxkbcommon-dev`,
+  `libxkbcommon-devel`); the tests and examples also link libgbm
+  (`libgbm-dev`, `mesa-libgbm-devel`). libwayland-client is loaded at run
+  time rather than linked; the library itself uses it only for
+  `Glasspane::bridge_clipboard`, the tests for their client.
+* For the examples, `foot` and a Chromium (`chromium`, `chromium-browser` or
+  `google-chrome`) on `PATH`.
+
+No display server is needed: glasspane is the server.
+
+## Running the examples
+
+```
+cargo run --example spawn_foot
+cargo run --example chromium_tenant -- https://example.com
+```
+
+The first starts `foot` on a private socket, runs the frame clock for two
+seconds, and writes what it drew to `foot.png`: a shell prompt, 800x480. The
+second does the same with Chromium and writes the page to `chromium.png`.
+Both print what the tenant did on the way: mapped, its title, its size, how
+many commits and how many dma-buf imports.
 
 ## Three rules that are load-bearing
 
@@ -46,8 +84,8 @@ through `wgpu` and [`wgpu-dmabuf`](../wgpu-dmabuf).
 
 A Wayland client paints **only** when it has been handed a frame callback. A
 compositor that answers callbacks "when something needs one" collapses to "when
-someone asks", and its tenants stall — measured in the prior art at 0.3–11
-seconds per frame, and stopping altogether when nothing was watching.
+someone asks", and its tenants stall, or stop altogether when nothing is
+watching.
 
 So glasspane never answers a callback on its own. `Glasspane::tick(now)` does,
 and you call it **once per frame of your clock, unconditionally** — whether or
@@ -92,7 +130,7 @@ has not is a parent and a place.
 
 ```rust
 for popup in pane.popups() {
-    let (x, y) = popup.position();   // top-left in popup.root()'s buffer pixels
+    let (x, y) = popup.position();   // top-left in popup.root()'s logical pixels
     let (w, h) = popup.size();
     let _ = popup.texture();         // draw it over the pane you drew root() on
 }
@@ -123,10 +161,13 @@ click.
 
 ## The input contract
 
-Coordinates are **tenant-local buffer pixels, origin top-left** — the same
-space as the texture you sampled. A shell that hit-tests a quad in its own
-scene converts to `[0, width) × [0, height)` and passes that; glasspane applies
-no transform, no scale and no clamp.
+Coordinates are **tenant-local logical pixels, origin top-left** — the space of
+`Tenant::size()`, which is the size the tenant was configured to. A shell that
+hit-tests a quad in its own scene converts to `[0, width) × [0, height)` of
+that size and passes that; glasspane applies no transform, no scale and no
+clamp. At scale 1 the texture is the same size. Above it
+(`Glasspane::set_scale`) the texture is larger than `size` by the scale, so
+sample it by UV and hit-test by `size`.
 
 ```rust
 pane.pointer_enter(id, x, y)?;   // and pointer_motion / pointer_leave
@@ -136,7 +177,7 @@ pane.set_keyboard_focus(Some(id))?;
 pane.keyboard_key(Some(id), 30 /* KEY_A */, KeyState::Pressed)?;
 ```
 
-A popup is aimed at the same way, through a `Target`, in **its own** buffer
+A popup is aimed at the same way, through a `Target`, in **its own** logical
 pixels rather than its parent's:
 
 ```rust
@@ -161,10 +202,16 @@ got it wrong" must not look alike. No display server is needed for any of them:
 glasspane *is* the server, on a private socket, and the test client is an
 in-process Wayland client on a thread.
 
+The test instance keeps Vulkan validation on but turns off wgpu's object names
+(`InstanceFlags::DEBUG`, which a debug build sets): with them, tests creating
+devices in parallel crashed inside the Vulkan loader
+([#6](https://github.com/oneilltomhq/glasspane/issues/6)).
+
 ## Measured here
 
 Intel Iris Xe Graphics (RPL-U), Mesa 25.3.6, kernel 7.1.9, `/dev/dri/renderD128`.
-7 integration tests + 6 unit tests, all passing, 5.6 s.
+17 unit tests, 29 integration tests and 2 doctests, all passing; the
+integration tests take 4–6 s in parallel.
 
 * shm and dma-buf tenant textures both **byte-exact over all 65 536 pixels** of
   a 256x256 lattice.
@@ -172,20 +219,20 @@ Intel Iris Xe Graphics (RPL-U), Mesa 25.3.6, kernel 7.1.9, `/dev/dri/renderD128`
   acquire ledger reads `exports=6 waits=6 carried=6 superseded=0
   live_semaphores=1` — one semaphore per live buffer, not per frame.
 * An unticked client: **1 commit, ever**, against 3 s of dispatch.
-* `foot`: maps, is configured to 798x480, paints through `wl_shm`.
-* Chromium 142 with `--ozone-platform=wayland`: maps in ~3 s, is configured to
-  1280x800, and commits **dma-buf** — 3 imports and 1 cache hit over 4 commits,
-  which is triple buffering, each one fenced. The page comes back pixel-correct
-  through `examples/chromium_tenant.rs`. It logs
+* `foot`: maps, is configured to 800x480, paints through `wl_shm`.
+* Chromium 151 with `--ozone-platform=wayland`: maps in ~2 s, is configured to
+  1280x800, and commits **dma-buf** — 3 imports and every later commit a cache
+  hit, which is triple buffering, each one fenced. The page comes back
+  pixel-correct through `examples/chromium_tenant.rs`. It logs
   `'--ozone-platform=wayland' is not compatible with Vulkan` from its own GPU
   process, which is about Chromium's internal rasteriser and not about this
   compositor; it renders through GL and shares the result as a dma-buf anyway.
 
 ## Status
 
-v0.1. shm and single-plane `ARGB8888`/`XRGB8888` dma-buf, `xdg_shell` toplevels
-and popups, server-side decorations refused politely, pointer, keyboard and
-axis injection.
+v0.1. shm and single-plane `ARGB8888`/`XRGB8888`/`ABGR8888`/`XBGR8888`
+dma-buf, `xdg_shell` toplevels and popups, server-side decorations refused
+politely, pointer, keyboard and axis injection.
 
 The clipboard (`wl_data_device`) and the primary selection
 (`zwp_primary_selection_device_manager_v1`) are relayed between tenants: copy
@@ -206,17 +253,13 @@ copying and pasting, and it works only while the window has the keyboard.
 Subsurfaces are composed into their toplevel's texture and take the pointer;
 the keyboard stays on the toplevel.
 
-Not yet: damage tracking
-(an shm commit uploads the whole buffer), multi-plane formats, drag-and-drop
-beyond the plumbing to accept it, `wp_viewport`, fractional scale, and KMS
-scanout of the composited result.
+A tenant draws at the scale it is asked (`Glasspane::set_scale`, sent as
+`wp_fractional_scale_v1` and `wl_surface.preferred_buffer_scale`), and a
+`wp_viewport` source rectangle is honoured.
 
-## Publishing
-
-`glasspane` depends on `wgpu-dmabuf` by path and by version. Until that crate
-is on crates.io, `cargo package` stops at "no matching package named
-`wgpu-dmabuf`"; everything before that step — the manifest, the file list,
-`cargo doc`, `cargo clippy --all-targets` — is clean.
+Not yet: damage tracking (an shm commit uploads the whole buffer), multi-plane
+formats, drag-and-drop beyond the plumbing to accept it, and KMS scanout of the
+composited result.
 
 ## License
 

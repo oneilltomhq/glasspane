@@ -25,11 +25,10 @@
 //!
 //! **The frame clock is yours to drive.** A Wayland client paints *only* when
 //! handed a frame callback. A compositor that answers callbacks "on demand"
-//! collapses to "when someone asks", and its tenants stall — measured
-//! elsewhere at 0.3–11 s per frame, and stopping entirely when nothing was
-//! watching. So glasspane never answers a callback by itself: [`Glasspane::tick`]
-//! does, and you call it once per frame of *your* clock, whether or not
-//! anything looks like it needs it.
+//! collapses to "when someone asks", and its tenants stall, or stop entirely
+//! when nothing is watching. So glasspane never answers a callback by itself:
+//! [`Glasspane::tick`] does, and you call it once per frame of *your* clock,
+//! whether or not anything looks like it needs it.
 //!
 //! **Import once per `wl_buffer`.** A client that re-commits the same buffer —
 //! every double-buffered client, forever — must produce exactly one dma-buf
@@ -37,9 +36,10 @@
 //!
 //! **The texture handle is stable while the size is.** Each tenant owns one
 //! texture; commits are copied into it. It is replaced only when the client's
-//! buffer size changes (a new size, or a new scale), which is announced as [`Event::Resized`] before any
-//! [`Event::Committed`] against the new handle. Index tenants by [`TenantId`],
-//! sample their textures, and never rebind per frame.
+//! buffer size changes (a new size, or a new scale), which is announced as
+//! [`Event::Resized`] before any [`Event::Committed`] against the new handle.
+//! Index tenants by [`TenantId`], sample their textures, and never rebind per
+//! frame.
 //!
 //! A client that draws into `wl_subsurface`s — Wine's menus, Waydroid's whole
 //! picture — still has one texture: its surface tree drawn together, on your
