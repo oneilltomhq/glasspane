@@ -19,10 +19,18 @@ fn gpu() -> Option<(wgpu::Adapter, wgpu::Device, wgpu::Queue)> {
         eprintln!("SKIP: no /dev/dri/renderD* on this machine");
         return None;
     }
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+    let mut descriptor = wgpu::InstanceDescriptor {
         backends: wgpu::Backends::VULKAN,
         ..wgpu::InstanceDescriptor::new_without_display_handle_from_env()
-    });
+    };
+    // Validation stays on; object names go. With `DEBUG`, which a debug build
+    // sets, every labelled object is named through vkSetDebugUtilsObjectNameEXT,
+    // and the loader's terminator for it crashes when another test thread is
+    // creating or destroying a device at the same time: the binary died with
+    // SIGSEGV in most parallel runs (#6). Serialising device creation alone
+    // did not stop it.
+    descriptor.flags.remove(wgpu::InstanceFlags::DEBUG);
+    let instance = wgpu::Instance::new(descriptor);
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         force_fallback_adapter: false,
