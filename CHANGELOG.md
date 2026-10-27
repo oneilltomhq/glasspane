@@ -42,7 +42,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and `dismiss_popups_of` do the same without a click.
 - `xdg_popup.reposition` is answered, and the popup moves.
 - `input::Target` and the `*_at` input entry points, for aiming pointer and
-  keyboard at a popup in its own buffer pixels. The `TenantId` entry points
+  keyboard at a popup in its own logical pixels. The `TenantId` entry points
   are unchanged.
 - `Error::NoSuchPopup`.
 - Primary selection: the `zwp_primary_selection_device_manager_v1` global,
