@@ -1,5 +1,7 @@
 # glasspane
 
+[![CI](https://github.com/oneilltomhq/glasspane/actions/workflows/ci.yml/badge.svg)](https://github.com/oneilltomhq/glasspane/actions/workflows/ci.yml)
+
 **A tenant Wayland compositor as a library.** It speaks Wayland to real clients
 — terminals, browsers — and its entire output is one `wgpu::Texture` per client
 plus an input-injection API.
