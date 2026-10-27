@@ -46,8 +46,8 @@ through `wgpu` and [`wgpu-dmabuf`](../wgpu-dmabuf).
 
 A Wayland client paints **only** when it has been handed a frame callback. A
 compositor that answers callbacks "when something needs one" collapses to "when
-someone asks", and its tenants stall — measured in the prior art at 0.3–11
-seconds per frame, and stopping altogether when nothing was watching.
+someone asks", and its tenants stall, or stop altogether when nothing is
+watching.
 
 So glasspane never answers a callback on its own. `Glasspane::tick(now)` does,
 and you call it **once per frame of your clock, unconditionally** — whether or
