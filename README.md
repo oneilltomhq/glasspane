@@ -211,13 +211,6 @@ Not yet: damage tracking
 beyond the plumbing to accept it, `wp_viewport`, fractional scale, and KMS
 scanout of the composited result.
 
-## Publishing
-
-`glasspane` depends on `wgpu-dmabuf` by path and by version. Until that crate
-is on crates.io, `cargo package` stops at "no matching package named
-`wgpu-dmabuf`"; everything before that step — the manifest, the file list,
-`cargo doc`, `cargo clippy --all-targets` — is clean.
-
 ## License
 
 MIT

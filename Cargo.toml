@@ -18,9 +18,7 @@ wgpu = { version = "30.0.1", default-features = false, features = [
     "vulkan",
     "wgsl",
 ] }
-# A version as well as a path: `cargo package` refuses a path-only dependency,
-# and the published crate must name what it needs from crates.io.
-wgpu-dmabuf = { path = "../wgpu-dmabuf", version = "0.1" }
+wgpu-dmabuf = "0.1"
 drm-fourcc = "2"
 libc = "0.2"
 tracing = "0.1"
@@ -57,7 +55,7 @@ png = "0.17"
 # allocator to mint a dma-buf with.
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
-wgpu-dmabuf = { path = "../wgpu-dmabuf", features = ["gbm"] }
+wgpu-dmabuf = { version = "0.1", features = ["gbm"] }
 
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]
