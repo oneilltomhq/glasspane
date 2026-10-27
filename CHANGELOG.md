@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-10-27
 
 ### Added
 
@@ -139,5 +139,5 @@ First release. A Wayland compositor whose only output is textures.
   that make a Chromium a tenant, plus a free CDP port.
 - `examples/spawn_foot.rs`: a terminal, headless, to a PNG.
 
-[Unreleased]: https://github.com/oneilltomhq/glasspane/compare/v0.1.0...HEAD
+[0.2.0]: https://github.com/oneilltomhq/glasspane/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/oneilltomhq/glasspane/releases/tag/v0.1.0
